@@ -62,7 +62,10 @@ class ClientDatabase:
                    message_blacklist: Optional[List[str]] = None,
                    allowed_types: Optional[List[str]] = None,
                    crypto_key: Optional[str] = None,
-                   password: Optional[str] = None) -> bool:
+                   password: Optional[str] = None,
+                   account_id: Optional[str] = None,
+                   hub_id: Optional[str] = None,
+                   policy_group_id: Optional[str] = None) -> bool:
         if crypto_key is not None:
             crypto_key = crypto_key[:16]
 
@@ -85,6 +88,12 @@ class ClientDatabase:
                 user.crypto_key = crypto_key
             if password:
                 user.password = password
+            if account_id is not None:
+                user.account_id = account_id
+            if hub_id is not None:
+                user.hub_id = hub_id
+            if policy_group_id is not None:
+                user.policy_group_id = policy_group_id
             return self.db.update_item(user)
 
         user = Client(
@@ -98,6 +107,9 @@ class ClientDatabase:
             is_admin=admin,
             password=password,
             allowed_types=allowed_types,
+            account_id=account_id or "",
+            hub_id=hub_id or "",
+            policy_group_id=policy_group_id or "",
         )
         return self.db.add_item(user)
 

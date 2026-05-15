@@ -108,7 +108,11 @@ def listen():
 @click.option("--password", required=False, type=str)
 @click.option("--crypto-key", required=False, type=str)
 @click.option("--admin", default=False, required=False, type=bool)
-def add_client(name, access_key, password, crypto_key, admin):
+@click.option("--account-id", required=False, type=str)
+@click.option("--hub-id", required=False, type=str)
+@click.option("--policy-group-id", required=False, type=str)
+def add_client(name, access_key, password, crypto_key, admin,
+               account_id, hub_id, policy_group_id):
     """
     Adds a new client to the database, generating credentials if not provided.
     
@@ -122,6 +126,9 @@ def add_client(name, access_key, password, crypto_key, admin):
         password: Optional password. If not provided, a random password is generated.
         crypto_key: Optional 16-character encryption key. If not provided, a random key is generated.
         admin: Boolean indicating whether the client should have administrator privileges.
+        account_id: Server-owned account this client belongs to.
+        hub_id: Server-owned hub this client belongs to.
+        policy_group_id: Server-owned policy group for dynamic ACL plugins.
     
     Raises:
         ValueError: If the crypto key is not exactly 16 characters, or if the client cannot be added.
@@ -147,7 +154,10 @@ def add_client(name, access_key, password, crypto_key, admin):
     with ClientDatabase() as db:
         name = name or f"HiveMind-Node-{db.total_clients()}"
         print(f"Database backend: {db.db.__class__.__name__}")
-        success = db.add_client(name, access_key, crypto_key=key, password=password, admin=admin)
+        success = db.add_client(name, access_key, crypto_key=key,
+                                password=password, admin=admin,
+                                account_id=account_id, hub_id=hub_id,
+                                policy_group_id=policy_group_id)
         if not success:
             raise ValueError(f"Error adding User to database: {name}")
 
@@ -159,6 +169,9 @@ def add_client(name, access_key, password, crypto_key, admin):
         print("Credentials added to database!\n")
         print("Node ID:", user.client_id)
         print("Admin Privileges:", admin)
+        print("Account ID:", user.account_id or "")
+        print("Hub ID:", user.hub_id or "")
+        print("Policy Group ID:", user.policy_group_id or "")
         print("Friendly Name:", name)
         print("Access Key:", access_key)
         print("Password:", password)
