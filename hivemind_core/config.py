@@ -85,6 +85,12 @@ _DEFAULT = {
     # the protocol keeps database I/O off the message-handling thread.
     "last_seen_update_interval": 0,
     "last_seen_queue_size": 1024,
+
+    # QUERY handling is isolated from websocket receive threads. Capacity is
+    # bounded so a slow skill backend produces an explicit busy response
+    # instead of unbounded thread or memory growth.
+    "query_workers": 16,
+    "query_queue_size": 256,
 }
 
 

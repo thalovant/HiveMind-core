@@ -48,7 +48,6 @@ def _protocol(db):
         handshake_enabled=True,
         policy_chain=MagicMock(),
     )
-    proto.shutdown()
     return proto
 
 

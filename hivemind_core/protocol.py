@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Union, List, Optional, Callable, Literal
@@ -108,6 +109,14 @@ def _non_negative_float(value, default: float) -> float:
     except (TypeError, ValueError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _bounded_int(value, default: int, minimum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= minimum else default
 
 
 class UnencryptedMessageError(ValueError):
@@ -419,8 +428,24 @@ class HiveMindListenerProtocol:
     _last_seen_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _last_seen_next_flush: dict = field(default_factory=dict, init=False, repr=False)
     _last_seen_queue_warning_after: float = field(default=0.0, init=False, repr=False)
+    query_workers = 16
+    query_queue_size = 256
+    _query_executor: Optional[ThreadPoolExecutor] = field(default=None, init=False, repr=False)
+    _query_slots: Optional[threading.BoundedSemaphore] = field(default=None, init=False, repr=False)
+    _query_workers_started: bool = field(default=False, init=False, repr=False)
+    _query_start_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        init=False,
+        repr=False,
+    )
+    _shutdown_requested: threading.Event = field(
+        default_factory=threading.Event,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self):
+        server_config = get_server_config()
         self.clients = {}
         # TOFU pinning store for INTERCOM origin authentication
         # (HIVEMIND-CRYPTO-1 §5). Maps a client's access key to the PEM
@@ -432,8 +457,18 @@ class HiveMindListenerProtocol:
         self._seen_flood_ids: set = set()
         self._pending_cascades: dict = {}  # query_id -> CascadeCollector
         self.last_seen_update_interval = _non_negative_float(
-            get_server_config().get("last_seen_update_interval", 0),
+            server_config.get("last_seen_update_interval", 0),
             0.0,
+        )
+        self.query_workers = _bounded_int(
+            server_config.get("query_workers", self.query_workers),
+            self.query_workers,
+            1,
+        )
+        self.query_queue_size = _bounded_int(
+            server_config.get("query_queue_size", self.query_queue_size),
+            self.query_queue_size,
+            0,
         )
         self.agent_protocol.hm_protocol = self
         if not self.binary_data_protocol:
@@ -444,7 +479,7 @@ class HiveMindListenerProtocol:
             self.binary_data_protocol.hm_protocol = self
         if self.policy_chain is None:
             from hivemind_core.policy import MessageTypeACLPolicy, DenyAllPolicy
-            cfg = get_server_config()
+            cfg = server_config
             try:
                 chain = PolicyChain.from_config(cfg, hm_protocol=self)
             except Exception:
@@ -476,6 +511,54 @@ class HiveMindListenerProtocol:
                 )
         # The activity writer starts lazily on the first message, after all
         # listener initialization has completed successfully.
+
+    def _start_query_workers(self) -> None:
+        """Start the bounded pool used for local QUERY answering."""
+        with self._query_start_lock:
+            if self._query_workers_started or self._shutdown_requested.is_set():
+                return
+            self._query_executor = ThreadPoolExecutor(
+                max_workers=self.query_workers,
+                thread_name_prefix="hivemind-query",
+            )
+            self._query_slots = threading.BoundedSemaphore(
+                self.query_workers + self.query_queue_size
+            )
+            self._query_workers_started = True
+
+    def _stop_query_workers(self) -> None:
+        """Stop accepting queries and drain running work during shutdown."""
+        executor = self._query_executor
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        self._query_executor = None
+        self._query_slots = None
+        self._query_workers_started = False
+
+    def _submit_query_worker(self, fn, *args) -> bool:
+        if self._shutdown_requested.is_set():
+            return False
+        if self._query_executor is None or self._query_slots is None:
+            self._start_query_workers()
+        executor = self._query_executor
+        slots = self._query_slots
+        if executor is None or slots is None or not slots.acquire(blocking=False):
+            return False
+
+        def _run() -> None:
+            try:
+                fn(*args)
+            except Exception:
+                LOG.exception("Unhandled HiveMind query worker error")
+            finally:
+                slots.release()
+
+        try:
+            executor.submit(_run)
+        except Exception:
+            slots.release()
+            raise
+        return True
 
     def get_bus(self, client: HiveMindClientConnection) -> Union[FakeBus, MessageBusClient]:
         # The agent decides which bus a client's messages land on. Default
@@ -603,7 +686,7 @@ class HiveMindListenerProtocol:
     def _start_last_seen_worker(self) -> None:
         """Start the best-effort writer for client activity timestamps."""
         with self._last_seen_start_lock:
-            if self._last_seen_worker_started:
+            if self._last_seen_worker_started or self._shutdown_requested.is_set():
                 return
             pending = queue.Queue(maxsize=self._last_seen_queue_size())
             self._last_seen_stop.clear()
@@ -639,6 +722,8 @@ class HiveMindListenerProtocol:
 
     def shutdown(self) -> None:
         """Release background resources owned by this listener protocol."""
+        self._shutdown_requested.set()
+        self._stop_query_workers()
         self._stop_last_seen_worker()
 
     def _last_seen_worker(self, pending: queue.Queue) -> None:
@@ -659,6 +744,8 @@ class HiveMindListenerProtocol:
 
     def touch_last_seen(self, client: HiveMindClientConnection) -> None:
         """Record activity without blocking message handling on database I/O."""
+        if self._shutdown_requested.is_set():
+            return
         seen_at = time.time()
         mono_now = time.monotonic()
         client.last_seen = seen_at
@@ -673,8 +760,11 @@ class HiveMindListenerProtocol:
 
         if self._last_seen_queue is None:
             self._start_last_seen_worker()
+        pending = self._last_seen_queue
+        if pending is None:
+            return
         try:
-            self._last_seen_queue.put_nowait((client, seen_at))
+            pending.put_nowait((client, seen_at))
         except queue.Full:
             retry_interval = max(interval, 1.0)
             with self._last_seen_lock:
@@ -818,7 +908,7 @@ class HiveMindListenerProtocol:
         else:
             self.handle_unknown_message(message, client)
 
-        self.touch_last_seen(client)
+        self.update_last_seen(client)
 
     # HiveMind protocol messages -  from slave -> master
     def handle_unknown_message(
@@ -1527,6 +1617,21 @@ class HiveMindListenerProtocol:
             self._route_query_response(message, client)
             return
 
+        if not self._submit_query_worker(
+                self._handle_query_request, message, client, metadata):
+            LOG.warning("HiveMind query worker queue is full")
+            query_id = metadata.get("query_id", str(uuid.uuid4()))
+            originator_peer = metadata.get("originator_peer", client.peer)
+            error_bus = Message("hive.query.timeout",
+                                {"query_id": query_id, "error": "busy"})
+            client.send(self._build_query_response(
+                HiveMessageType.QUERY, error_bus, query_id,
+                originator_peer, self.peer, route=message.route))
+
+    def _handle_query_request(self, message: HiveMessage,
+                              client: HiveMindClientConnection,
+                              metadata: dict):
+        """Answer or escalate one QUERY request off the websocket hot path."""
         payload = self._unpack_message(message, client)
         if not client.can_escalate:
             LOG.warning("Received QUERY from client without escalate permission")
