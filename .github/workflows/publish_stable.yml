@@ -1,3 +1,7 @@
+permissions:
+  contents: write
+  pull-requests: write
+
 name: Publish Stable Release
 
 on:
@@ -7,7 +11,7 @@ on:
 
 jobs:
   publish_stable:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/publish-stable.yml@dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/publish-stable.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
     secrets:
       PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
       MATRIX_TOKEN: ${{ secrets.MATRIX_TOKEN }}

@@ -1,3 +1,6 @@
+permissions:
+  contents: read
+
 name: Code Coverage
 
 on:
@@ -7,7 +10,7 @@ on:
 
 jobs:
   coverage:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
     with:
       python_version: '3.11'
       coverage_source: 'hivemind_core'
