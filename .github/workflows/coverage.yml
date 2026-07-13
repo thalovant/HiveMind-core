@@ -24,7 +24,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install pytest pytest-cov coverage[toml]
-          python -m pip install "hivescope @ git+https://github.com/JarbasHiveMind/hivescope@dev"
+          python -m pip install "hivescope @ git+https://github.com/JarbasHiveMind/hivescope@1ae22f9addbc60d7aeae111636868aba0710760c"
           python -m pip install -e .
 
       - name: Run tests with coverage
