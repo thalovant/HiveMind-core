@@ -2,7 +2,6 @@
 # Copyright (C) 2026 Casimiro Ferreira
 # SPDX-License-Identifier: Apache-2.0
 import csv
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -46,14 +45,6 @@ def redact_sensitive_config(value):
     if isinstance(value, list):
         return [redact_sensitive_config(item) for item in value]
     return value
-
-
-def credential_fingerprint(value: str | None) -> str:
-    """Return a non-reversible identifier suitable for administrative output."""
-    if not value:
-        return "<unset>"
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
-    return f"sha256:{digest[:12]}"
 
 
 def open_private_text_file(path: Path):
@@ -268,7 +259,6 @@ def add_client(name, access_key, password, crypto_key, admin, metadata,
         print("Node ID:", user.client_id)
         print("Admin Privileges:", admin)
         print("Friendly Name:", name)
-        print("Access Key ID:", credential_fingerprint(access_key))
         print("Credentials:", _REDACTED)
         if credentials_file is not None:
             with open_private_text_file(credentials_file) as credential_stream:
@@ -383,7 +373,6 @@ def delete_client(node_id):
                 print("Revoked credentials!\n")
                 print("Node ID:", client.client_id)
                 print("Friendly Name:", client.name)
-                print("Access Key ID:", credential_fingerprint(client.api_key))
                 print("Credentials:", _REDACTED)
                 break
         else:
@@ -395,14 +384,12 @@ def list_clients():
     """
     Displays a formatted table of clients without exposing stored credentials.
     
-    Excludes clients with a client ID of -1 from the listing. Access keys are
-    represented by a non-reversible fingerprint for administrative correlation.
+    Excludes clients with a client ID of -1 from the listing.
     """
     console = Console()
     table = Table(title="HiveMind Clients:")
     table.add_column("ID", justify="center")
     table.add_column("Name", justify="center")
-    table.add_column("Access Key ID", justify="center")
     table.add_column("Admin", justify="center")
 
     with ClientDatabase() as db:
@@ -411,7 +398,6 @@ def list_clients():
                 table.add_row(
                     str(x["client_id"]),
                     x["name"],
-                    credential_fingerprint(x["api_key"]),
                     str(bool(x["is_admin"])),
                 )
 
