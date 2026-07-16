@@ -58,7 +58,8 @@ def _answer(master, sentences, delay=0.0):
 
 
 def test_query_streams_multiple_chunks():
-    b = _single(); b.start_all()
+    b = _single()
+    b.start_all()
     try:
         _answer(b.get_master("M0"), ["first.", "second.", "third."])
         s = b.get_satellite("S0")
@@ -74,7 +75,8 @@ def test_query_streams_multiple_chunks():
 def test_query_async_agent_answer_is_collected():
     """The agent answers on another thread, 0.3s after the inject returns —
     the streaming wait must still capture it."""
-    b = _single(); b.start_all()
+    b = _single()
+    b.start_all()
     try:
         _answer(b.get_master("M0"), ["the async answer"], delay=0.3)
         s = b.get_satellite("S0")
@@ -89,7 +91,8 @@ def test_query_async_agent_answer_is_collected():
 def test_query_escalates_up_the_relay_chain():
     """S0's QUERY can't be answered by the relay R0 (no agent responder there);
     it escalates to M0, which answers, and the response routes back to S0."""
-    b = _relay_chain(); b.start_all()
+    b = _relay_chain()
+    b.start_all()
     try:
         _answer(b.get_master("M0"), ["answered upstream"])  # only the top master answers
         s = b.get_satellite("S0")
@@ -102,7 +105,8 @@ def test_query_escalates_up_the_relay_chain():
 
 
 def test_cascade_round_trip_single_node():
-    b = _single(); b.start_all()
+    b = _single()
+    b.start_all()
     try:
         _answer(b.get_master("M0"), ["cascade answer"])
         s = b.get_satellite("S0")
@@ -132,7 +136,8 @@ def _two_relay_chain():
 
 
 def test_query_traverses_two_relays_only_third_answers():
-    b = _two_relay_chain(); b.start_all()
+    b = _two_relay_chain()
+    b.start_all()
     try:
         # ONLY the top master answers; R2 and R1 have no agent answer -> escalate
         _answer(b.get_master("M0"), ["answered at the top after two hops"])

@@ -574,7 +574,6 @@ class TestObserveNotCalledWhenDenied(unittest.TestCase):
         was not emitted — callers must not invoke observe() in that path.
         We assert the contract at the caller-test level by ensuring the
         chain's review() result is denied and the caller can branch."""
-        chain = PolicyChain(policies=[_DenyPolicy(), _AllowPolicy()])
         observed = _AllowPolicy()
         chain_with_observer = PolicyChain(policies=[_DenyPolicy(), observed])
         v = chain_with_observer.review(_msg(), client=None)
@@ -804,7 +803,7 @@ class TestProtocolWiring(unittest.TestCase):
     def test_observe_called_after_emit(self):
         """observe() fires after bus.emit, and exceptions are swallowed."""
         from hivemind_core.policy import PolicyChain
-        from hivemind_plugin_manager import PolicyPlugin, Verdict
+        from hivemind_plugin_manager import PolicyPlugin
 
         observe_calls: list = []
 
