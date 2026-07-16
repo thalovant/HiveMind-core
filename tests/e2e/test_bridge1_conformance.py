@@ -25,7 +25,7 @@ import importlib.util
 import time
 
 import pytest
-from hivemind_bus_client.message import HiveMessage, HiveMessageType
+from hivemind_bus_client.message import HiveMessageType
 from ovos_bus_client.message import Message
 from ovos_bus_client.session import Session
 
@@ -39,9 +39,8 @@ from hivescope.assertions import (
     assert_fifo_order,
     assert_session_propagated_unchanged,
     assert_source_hidden,
-    assert_session_blacklists_injected,
 )
-from hivescope.scenarios import single_satellite, three_satellites, chain_topology
+from hivescope.scenarios import chain_topology
 
 # ---------------------------------------------------------------------------
 # Skipif markers — copy these into your test file unchanged.

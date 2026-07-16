@@ -1,6 +1,5 @@
 """Handshake authentication: registered keys connect; unknown ones don't."""
 
-import pytest
 
 from hivescope import TopologyBuilder
 from hivescope.assertions import assert_handshake_complete

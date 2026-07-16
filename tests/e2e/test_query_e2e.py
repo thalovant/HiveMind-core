@@ -2,7 +2,6 @@
 synchronously through the policy admission chain; the response is routed back
 to the originating satellite.
 """
-import time
 
 import pytest
 
@@ -19,8 +18,8 @@ def test_query_local_agent_round_trip():
     m = b.add_master("M0")
     m.register_satellite("sat-key", password="sat-pw",
                          allowed_types=["recognizer_loop:utterance"])
-    s = b.add_satellite("S0", upstream=m,
-                        allowed_types=["recognizer_loop:utterance"])
+    b.add_satellite("S0", upstream=m,
+                    allowed_types=["recognizer_loop:utterance"])
     b.start_all()
     try:
         master = b.get_master("M0")
