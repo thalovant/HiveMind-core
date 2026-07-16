@@ -11,7 +11,7 @@ on:
 
 jobs:
   license_check:
-    uses: OpenVoiceOS/gh-automations/.github/workflows/license-check.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
+    uses: OpenVoiceOS/gh-automations/.github/workflows/license-check.yml@02b4bf45467b832c0e03c2e15ed02daa584b8386 # dev
     with:
       # The package itself ships under Apache-2.0 — exclude it from the
       # downstream-licence audit to avoid self-flagging.
