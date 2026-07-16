@@ -57,7 +57,12 @@ The file is created with defaults on first run if absent.
     "chain": [
       {"module": "hivemind-ovos-agent-policy"}
     ]
-  }
+  },
+
+  "last_seen_update_interval": 0,
+  "last_seen_queue_size": 1024,
+  "query_workers": 16,
+  "query_queue_size": 256
 }
 ```
 
@@ -70,6 +75,10 @@ The file is created with defaults on first run if absent.
 | `binarize` | bool | `false` | Enable HiveMind binarization protocol (requires compatible client version) |
 | `allowed_encodings` | list | see above | Ordered list of accepted message encodings; first match wins during handshake |
 | `allowed_ciphers` | list | `["CHACHA20-POLY1305", "AES-GCM"]` | Accepted session ciphers; first match wins |
+| `last_seen_update_interval` | number | `0` | Minimum seconds between persisted activity updates for one access key; writes run off the message loop |
+| `last_seen_queue_size` | integer | `1024` | Maximum pending best-effort activity writes before new updates are dropped with a rate-limited warning |
+| `query_workers` | integer | `16` | Maximum concurrent local QUERY handlers |
+| `query_queue_size` | integer | `256` | Additional queued QUERY requests; excess requests receive an explicit `busy` response |
 
 ---
 
