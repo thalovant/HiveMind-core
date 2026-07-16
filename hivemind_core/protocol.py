@@ -781,7 +781,25 @@ class HiveMindListenerProtocol:
         """track timestamps of last client interaction"""
         timestamp = seen_at if seen_at is not None else time.time()
         with self.db:
-            if not self.db.update_last_seen(client.key, timestamp):
+            backend_update = getattr(self.db, "update_last_seen", None)
+            if callable(backend_update):
+                updated = bool(backend_update(client.key, timestamp))
+            else:
+                # Compatibility for test harnesses and older third-party
+                # database adapters injected directly instead of through the
+                # ClientDatabase wrapper used by the service.
+                user = self.db.get_client_by_api_key(client.key)
+                if user is None:
+                    updated = False
+                else:
+                    current = getattr(user, "last_seen", -1)
+                    if current is None or timestamp > current:
+                        user.last_seen = timestamp
+                        result = self.db.update_item(user)
+                        updated = result is not False
+                    else:
+                        updated = True
+            if not updated:
                 # key was revoked / never existed — nothing to update
                 LOG.debug(f"can not update last seen, no client for key: {client.key}")
                 return
@@ -908,7 +926,7 @@ class HiveMindListenerProtocol:
         else:
             self.handle_unknown_message(message, client)
 
-        self.update_last_seen(client)
+        self.touch_last_seen(client)
 
     # HiveMind protocol messages -  from slave -> master
     def handle_unknown_message(
