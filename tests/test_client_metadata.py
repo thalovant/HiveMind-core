@@ -1,3 +1,5 @@
+import json
+from stat import S_IMODE
 from unittest.mock import patch
 
 import pytest
@@ -8,7 +10,11 @@ from hivemind_core.database import ClientDatabase
 from hivemind_core.scripts import (
     add_client,
     blacklist_skill,
+    delete_client,
+    export_clients,
+    list_clients,
     parse_client_metadata,
+    print_config,
     set_metadata,
 )
 
@@ -32,6 +38,10 @@ class MemoryDB:
                 self.clients[i] = client
                 return True
         self.clients.append(client)
+        return True
+
+    def delete_item(self, client):
+        self.clients = [item for item in self.clients if item.client_id != client.client_id]
         return True
 
     def __len__(self):
@@ -212,6 +222,101 @@ def test_cli_add_client_without_metadata_omits_metadata_line():
 
     assert result.exit_code == 0, result.output
     assert "Metadata:" not in result.output
+
+
+def test_cli_add_client_never_prints_plaintext_credentials():
+    runner = CliRunner()
+    fake_db = make_client_db()
+
+    with patch("hivemind_core.scripts.ClientDatabase", return_value=_patched_db_ctx(fake_db)):
+        result = runner.invoke(
+            add_client,
+            ["--name", "satellite", "--access-key", "access-secret",
+             "--password", "password-secret", "--allow-weak-password"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "access-secret" not in result.output
+    assert "password-secret" not in result.output
+    assert "<redacted>" in result.output
+
+
+def test_cli_add_client_requires_private_file_for_generated_credentials(tmp_path):
+    runner = CliRunner()
+    fake_db = make_client_db()
+
+    with patch("hivemind_core.scripts.ClientDatabase", return_value=_patched_db_ctx(fake_db)):
+        missing = runner.invoke(add_client, ["--name", "satellite"])
+        credentials_path = tmp_path / "client.json"
+        created = runner.invoke(
+            add_client,
+            ["--name", "satellite", "--credentials-file", str(credentials_path)],
+        )
+
+    assert missing.exit_code != 0
+    assert "--credentials-file is required" in missing.output
+    assert created.exit_code == 0, created.output
+    payload = json.loads(credentials_path.read_text())
+    assert payload["access_key"]
+    assert payload["password"]
+    assert S_IMODE(credentials_path.stat().st_mode) == 0o600
+    assert payload["access_key"] not in created.output
+    assert payload["password"] not in created.output
+
+
+def test_cli_client_listing_and_deletion_redact_credentials():
+    runner = CliRunner()
+    fake_db = make_client_db()
+    fake_db.add_client(name="satellite", key="access-secret", password="password-secret",
+                       crypto_key="crypto-secret")
+    client = fake_db.get_client_by_api_key("access-secret")
+
+    with patch("hivemind_core.scripts.ClientDatabase", return_value=_patched_db_ctx(fake_db)):
+        listed = runner.invoke(list_clients)
+        deleted = runner.invoke(delete_client, [str(client.client_id)])
+
+    assert listed.exit_code == 0, listed.output
+    assert deleted.exit_code == 0, deleted.output
+    for output in (listed.output, deleted.output):
+        assert "access-secret" not in output
+        assert "password-secret" not in output
+        assert "crypto-secret" not in output
+
+
+def test_cli_print_config_redacts_nested_credentials():
+    runner = CliRunner()
+    config = {
+        "database": {"redis": {"password": "redis-secret", "host": "redis"}},
+        "token": "api-token",
+    }
+    with patch("hivemind_core.scripts.get_server_config", return_value=config):
+        result = runner.invoke(print_config)
+
+    assert result.exit_code == 0, result.output
+    assert "redis-secret" not in result.output
+    assert "api-token" not in result.output
+    assert result.output.count("<redacted>") == 2
+
+
+def test_cli_export_credentials_requires_private_new_file(tmp_path):
+    runner = CliRunner()
+    fake_db = make_client_db()
+    fake_db.add_client(name="satellite", key="access-secret", password="password-secret",
+                       crypto_key="crypto-secret")
+    export_path = tmp_path / "clients.csv"
+
+    with patch("hivemind_core.scripts.ClientDatabase", return_value=_patched_db_ctx(fake_db)):
+        exported = runner.invoke(export_clients, ["--path", str(export_path)])
+        overwrite = runner.invoke(export_clients, ["--path", str(export_path)])
+
+    assert exported.exit_code == 0, exported.output
+    assert S_IMODE(export_path.stat().st_mode) == 0o600
+    text = export_path.read_text()
+    assert "access-secret" in text
+    assert "password-secret" in text
+    assert "access-secret" not in exported.output
+    assert overwrite.exit_code != 0
+    assert "refusing to overwrite" in overwrite.output
 
 
 # --- password-strength gate + derive-psk --------------------------------------

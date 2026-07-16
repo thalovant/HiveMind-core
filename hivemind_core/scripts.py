@@ -1,10 +1,13 @@
 # hivemind-core
 # Copyright (C) 2026 Casimiro Ferreira
 # SPDX-License-Identifier: Apache-2.0
+import csv
+import hashlib
+import json
 import os
+from pathlib import Path
 
 import click
-import json
 from rich.console import Console
 from rich.prompt import Prompt
 from rich.table import Table
@@ -12,6 +15,51 @@ from rich.table import Table
 from hivemind_core.database import ClientDatabase
 from hivemind_core.service import HiveMindService
 from hivemind_core.config import get_server_config
+
+
+_REDACTED = "<redacted>"
+_SENSITIVE_CONFIG_KEYS = {
+    "access_key",
+    "api_key",
+    "crypto_key",
+    "password",
+    "private_key",
+    "secret",
+    "token",
+}
+
+
+def redact_sensitive_config(value):
+    """Return a copy of a configuration value with credentials removed."""
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            normalized = str(key).lower().replace("-", "_")
+            if any(
+                normalized == marker or normalized.endswith(f"_{marker}")
+                for marker in _SENSITIVE_CONFIG_KEYS
+            ):
+                redacted[key] = _REDACTED
+            else:
+                redacted[key] = redact_sensitive_config(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive_config(item) for item in value]
+    return value
+
+
+def credential_fingerprint(value: str | None) -> str:
+    """Return a non-reversible identifier suitable for administrative output."""
+    if not value:
+        return "<unset>"
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return f"sha256:{digest[:12]}"
+
+
+def open_private_text_file(path: Path):
+    """Create a new owner-readable credential file without following a racey overwrite."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    return os.fdopen(descriptor, "w", encoding="utf-8", newline="")
 
 
 def parse_client_metadata(metadata):
@@ -88,7 +136,7 @@ def print_config():
     """
     Prints the current HiveMind server configuration as formatted JSON to the console.
     """
-    cfg = get_server_config()
+    cfg = redact_sensitive_config(get_server_config())
     cfg = json.dumps(cfg, indent=2, ensure_ascii=False)
     console = Console()
     console.print(cfg)
@@ -131,10 +179,17 @@ def derive_psk(password, node_id):
 @click.option("--crypto-key", required=False, type=str)
 @click.option("--admin", default=False, required=False, type=bool)
 @click.option("--metadata", required=False, type=str, help="Client metadata as a JSON object.")
+@click.option(
+    "--credentials-file",
+    required=False,
+    type=click.Path(path_type=Path, dir_okay=False),
+    help="Write generated credentials to a new owner-readable JSON file.",
+)
 @click.option("--allow-weak-password", is_flag=True, default=False,
               help="Skip the password-strength check (not recommended). By default a "
                    "guessable/low-entropy --password is refused.")
-def add_client(name, access_key, password, crypto_key, admin, metadata, allow_weak_password):
+def add_client(name, access_key, password, crypto_key, admin, metadata,
+               credentials_file, allow_weak_password):
     """
     Adds a new client to the database, generating credentials if not provided.
     
@@ -153,6 +208,16 @@ def add_client(name, access_key, password, crypto_key, admin, metadata, allow_we
     Raises:
         ValueError: If the crypto key is not exactly 16 characters, or if the client cannot be added.
     """
+    if (access_key is None or password is None) and credentials_file is None:
+        raise click.UsageError(
+            "--credentials-file is required when access keys or passwords are generated"
+        )
+    if credentials_file is not None and credentials_file.exists():
+        raise click.BadParameter(
+            "must not already exist",
+            param_hint="--credentials-file",
+        )
+
     key = crypto_key
     if key:
         print(
@@ -203,9 +268,24 @@ def add_client(name, access_key, password, crypto_key, admin, metadata, allow_we
         print("Node ID:", user.client_id)
         print("Admin Privileges:", admin)
         print("Friendly Name:", name)
-        print("Access Key:", access_key)
-        print("Password:", password)
-        print("Encryption Key:", key)
+        print("Access Key ID:", credential_fingerprint(access_key))
+        print("Credentials:", _REDACTED)
+        if credentials_file is not None:
+            with open_private_text_file(credentials_file) as credential_stream:
+                json.dump(
+                    {
+                        "access_key": access_key,
+                        "password": password,
+                        "crypto_key": key,
+                        "client_id": user.client_id,
+                        "name": name,
+                    },
+                    credential_stream,
+                    indent=2,
+                    sort_keys=True,
+                )
+                credential_stream.write("\n")
+            print("Credentials file:", credentials_file)
         if client_metadata is not None:
             print("Metadata:", json.dumps(user.metadata, sort_keys=True, ensure_ascii=False))
 
@@ -300,31 +380,30 @@ def delete_client(node_id):
         for client in db:
             if client.client_id == int(node_id):
                 db.delete_client(client.api_key)
-                print(f"Revoked credentials!\n")
+                print("Revoked credentials!\n")
                 print("Node ID:", client.client_id)
                 print("Friendly Name:", client.name)
-                print("Access Key:", client.api_key)
-                print("Password:", client.password)
-                print("Encryption Key:", client.crypto_key)
+                print("Access Key ID:", credential_fingerprint(client.api_key))
+                print("Credentials:", _REDACTED)
                 break
         else:
             print("Invalid Node ID!")
 
 
-@hmcore_cmds.command(help="List all clients and their credentials.", name="list-clients")
+@hmcore_cmds.command(help="List clients without exposing credentials.", name="list-clients")
 def list_clients():
     """
-    Displays a formatted table of all clients and their credentials stored in the database.
+    Displays a formatted table of clients without exposing stored credentials.
     
-    Excludes clients with a client ID of -1 from the listing. The table includes each client's ID, name, access key, password, and crypto key.
+    Excludes clients with a client ID of -1 from the listing. Access keys are
+    represented by a non-reversible fingerprint for administrative correlation.
     """
     console = Console()
-    table = Table(title="HiveMind Credentials:")
+    table = Table(title="HiveMind Clients:")
     table.add_column("ID", justify="center")
     table.add_column("Name", justify="center")
-    table.add_column("Access Key", justify="center")
-    table.add_column("Password", justify="center")
-    table.add_column("Crypto Key", justify="center")
+    table.add_column("Access Key ID", justify="center")
+    table.add_column("Admin", justify="center")
 
     with ClientDatabase() as db:
         for x in db:
@@ -332,38 +411,56 @@ def list_clients():
                 table.add_row(
                     str(x["client_id"]),
                     x["name"],
-                    x["api_key"],
-                    x["password"],
-                    x["crypto_key"],
+                    credential_fingerprint(x["api_key"]),
+                    str(bool(x["is_admin"])),
                 )
 
     console.print(table)
 
 
 @hmcore_cmds.command(help="Export clients and credentials to a CSV file.", name="export-clients")
-@click.option("--path", required=False, type=str)
+@click.option(
+    "--path",
+    required=True,
+    type=click.Path(path_type=Path, file_okay=True, dir_okay=True),
+    help="New CSV file path, or a directory in which to create hivemind_clients.csv.",
+)
 def export_clients(path):
     """
-    Exports all client credentials to a CSV file or prints them to stdout.
+    Exports all client credentials to a new owner-readable CSV file.
     
-    If a directory path is provided, the CSV will be saved as 'hivemind_clients.csv' in that directory. If a file path is provided, the CSV will be saved to that file. If no path is given, the CSV content is printed to stdout. Excludes clients with client_id == -1.
+    If a directory path is provided, the CSV is saved as
+    ``hivemind_clients.csv`` in that directory. Existing files are never
+    overwritten. Clients with ``client_id == -1`` are excluded.
     
     Args:
-        path: Optional file or directory path for the CSV output.
+        path: File or directory path for the CSV output.
     """
-    if path and os.path.isdir(path):
-        path = os.path.join(path, "hivemind_clients.csv")
+    if path.is_dir():
+        path = path / "hivemind_clients.csv"
 
-    CSV = "client_id,name,is_admin,access_key,password,crypto_key"
-    with ClientDatabase() as db:
-        for x in db:
-            if x["client_id"] != -1:
-                CSV += f"\n{x['client_id']},{x['name']},{x['is_admin']},{x['api_key']},{x['password']},{x['crypto_key']}"
-    if path:
-        with open(path, "w") as f:
-            f.write(CSV)
-    else:
-        print(CSV)
+    try:
+        with open_private_text_file(path) as stream:
+            writer = csv.writer(stream)
+            writer.writerow(
+                ("client_id", "name", "is_admin", "access_key", "password", "crypto_key")
+            )
+            with ClientDatabase() as db:
+                for client in db:
+                    if client["client_id"] != -1:
+                        writer.writerow(
+                            (
+                                client["client_id"],
+                                client["name"],
+                                client["is_admin"],
+                                client["api_key"],
+                                client["password"],
+                                client["crypto_key"],
+                            )
+                        )
+    except FileExistsError as error:
+        raise click.ClickException(f"refusing to overwrite existing file: {path}") from error
+    print("Credentials exported to owner-readable file:", path)
 
 
 @hmcore_cmds.command(help="Allow a message type to be sent from a client.", name="allow-msg")
