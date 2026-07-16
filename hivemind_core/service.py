@@ -1,20 +1,8 @@
 # hivemind-core
 # Copyright (C) 2026 Casimiro Ferreira
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: Apache-2.0
 import dataclasses
-from typing import Any, Callable, List, Optional, Type
+from typing import Callable, Optional, Type
 
 from ovos_utils import create_daemon, wait_for_exit_signal
 from ovos_utils.log import LOG
@@ -24,15 +12,7 @@ from hivemind_bus_client.identity import NodeIdentity
 from hivemind_core.config import get_server_config
 from hivemind_core.database import ClientDatabase
 from hivemind_core.protocol import HiveMindListenerProtocol, ClientCallbacks
-from hivemind_plugin_manager import (AgentProtocolFactory,
-                                     NetworkProtocolFactory,
-                                     BinaryDataHandlerProtocolFactory)
-try:
-    from hivemind_plugin_manager import PolicyProtocolFactory
-    from hivemind_plugin_manager.protocols import PolicyProtocol
-except ImportError:
-    PolicyProtocolFactory = None
-    PolicyProtocol = Any
+from hivemind_plugin_manager import AgentProtocolFactory, NetworkProtocolFactory, BinaryDataHandlerProtocolFactory
 from hivemind_plugin_manager.protocols import BinaryDataHandlerProtocol
 
 def get_agent_protocol():
@@ -48,20 +28,6 @@ def get_binary_protocol():
         # dummy by default
         return BinaryDataHandlerProtocol, {}
     return BinaryDataHandlerProtocolFactory.get_class(name), config.get(name, {})
-
-
-def get_policy_protocols() -> List[PolicyProtocol]:
-    policies = []
-    for plug_name, plug_conf in (get_server_config().get("policy") or {}).items():
-        plug_conf = plug_conf or {}
-        if plug_conf.get("enabled", True) is False:
-            continue
-        if PolicyProtocolFactory is None:
-            raise RuntimeError("Policy plugins require hivemind-plugin-manager with hivemind.policy support")
-        policy_class = PolicyProtocolFactory.get_class(plug_name)
-        LOG.info(f"Policy protocol: {policy_class.__name__}")
-        policies.append(policy_class(config=plug_conf))
-    return policies
 
 
 def on_ready():
@@ -130,6 +96,35 @@ class HiveMindService:
                                                      ))
         self._status.set_alive()
 
+    def _start_presence(self) -> None:
+        """Optionally advertise this hivemind-core server on the local network
+        via hivemind-presence (UPnP/SSDP and/or zeroconf mDNS). No-op when the
+        optional package is not installed or presence is disabled."""
+        try:
+            from hivemind_presence import LocalPresence
+        except ImportError:
+            return
+        cfg = get_server_config()
+        presence_cfg = cfg.get("presence", {})
+        if not presence_cfg.get("enabled", True):
+            return
+        net = cfg.get("network_protocol", {})
+        first = next(iter(net.values()), {}) if net else {}
+        self._presence = LocalPresence(
+            port=first.get("port", 5678),
+            ssl=first.get("ssl", False),
+            name=presence_cfg.get("name", "HiveMind-Node"),
+            upnp=presence_cfg.get("upnp", False),
+            zeroconf=presence_cfg.get("zeroconf", True),
+        )
+        create_daemon(self._presence.start)
+        LOG.info("LocalPresence started")
+
+    def _stop_presence(self) -> None:
+        presence = getattr(self, "_presence", None)
+        if presence is not None:
+            presence.stop()
+
     def run(self):
         self._status.set_started()
 
@@ -145,15 +140,13 @@ class HiveMindService:
         LOG.info(f"BinaryData protocol: {bin_class.__name__}")
 
         bin_protocol = bin_class(agent_protocol=agent_protocol, config=bin_config)
-        policy_protocols = get_policy_protocols()
 
         # start hivemind protocol that will handle HiveMessages
         hm_protocol = self.hm_protocol(identity=self.identity,
                                        db=self.db,
                                        callbacks=self.callbacks,
                                        binary_data_protocol=bin_protocol,
-                                       agent_protocol=agent_protocol,
-                                       policy_protocols=policy_protocols)
+                                       agent_protocol=agent_protocol)
 
         # start network protocols that will carry HiveMessages
         protos = []
@@ -175,6 +168,8 @@ class HiveMindService:
 
         self._status.set_ready()
 
+        self._start_presence()
         wait_for_exit_signal()  # block until ctrl+c
 
+        self._stop_presence()
         self._status.set_stopping()

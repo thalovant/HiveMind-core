@@ -1,19 +1,6 @@
 # hivemind-core
 # Copyright (C) 2026 Casimiro Ferreira
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
-from dataclasses import fields
+# SPDX-License-Identifier: Apache-2.0
 from typing import Any, Dict, List, Optional, Iterable
 
 from ovos_utils.log import LOG
@@ -21,10 +8,6 @@ from ovos_utils.log import LOG
 from hivemind_core.config import get_server_config
 from hivemind_plugin_manager import DatabaseFactory
 from hivemind_plugin_manager.database import Client
-
-
-CLIENT_SUPPORTS_METADATA = any(field.name == "metadata" for field in fields(Client))
-METADATA_SUPPORT_REQUIRED = "Client.metadata requires hivemind-plugin-manager metadata support"
 
 
 class ClientDatabase:
@@ -53,38 +36,50 @@ class ClientDatabase:
         return self.db.search_by_value("name", name)
 
     def get_client_by_api_key(self, api_key: str) -> Optional[Client]:
+        direct_lookup = getattr(self.db, "get_client_by_api_key", None)
+        if callable(direct_lookup):
+            return direct_lookup(api_key)
         search: List[Client] = self.db.search_by_value("api_key", api_key)
         if len(search):
             return search[0]
         return None
 
+    def get_client_by_id(self, client_id: int) -> Optional[Client]:
+        return self.db.get_client_by_id(client_id)
+
+    def refresh(self, client_id: int) -> Optional[Client]:
+        return self.db.refresh(client_id)
+
     def add_client(self,
                    name: str,
                    key: str = "",
                    admin: bool = False,
-                   intent_blacklist: Optional[List[str]] = None,
-                   skill_blacklist: Optional[List[str]] = None,
-                   message_blacklist: Optional[List[str]] = None,
                    allowed_types: Optional[List[str]] = None,
                    crypto_key: Optional[str] = None,
                    password: Optional[str] = None,
-                   metadata: Optional[Dict[str, Any]] = None) -> bool:
+                   metadata: Optional[Dict[str, Any]] = None,
+                   # Deprecated kwargs — folded into metadata. Kept so the
+                   # CLI and external callers using the old signature keep
+                   # working. Client.deserialize handles the same migration
+                   # on the read side. See HiveMind-core#85.
+                   intent_blacklist: Optional[List[str]] = None,
+                   skill_blacklist: Optional[List[str]] = None,
+                   message_blacklist: Optional[List[str]] = None) -> bool:
         if crypto_key is not None:
             crypto_key = crypto_key[:16]
-        if metadata is not None and not CLIENT_SUPPORTS_METADATA:
-            raise RuntimeError(METADATA_SUPPORT_REQUIRED)
+
+        # Migrate any legacy blacklist kwargs into metadata.
+        meta = dict(metadata) if metadata else {}
+        for k, v in (("skill_blacklist", skill_blacklist),
+                     ("intent_blacklist", intent_blacklist),
+                     ("message_blacklist", message_blacklist)):
+            if v:
+                meta.setdefault(k, list(v))
 
         user = self.get_client_by_api_key(key)
         if user:
-            # Update the existing client object directly
             if name:
                 user.name = name
-            if intent_blacklist:
-                user.intent_blacklist = intent_blacklist
-            if skill_blacklist:
-                user.skill_blacklist = skill_blacklist
-            if message_blacklist:
-                user.message_blacklist = message_blacklist
             if allowed_types:
                 user.allowed_types = allowed_types
             if admin is not None:
@@ -93,25 +88,23 @@ class ClientDatabase:
                 user.crypto_key = crypto_key
             if password:
                 user.password = password
-            if metadata is not None:
-                user.metadata = dict(metadata)
+            if meta:
+                # merge — don't blow away existing metadata
+                merged = dict(user.metadata)
+                merged.update(meta)
+                user.metadata = merged
             return self.db.update_item(user)
 
-        client_data = {
-            "api_key": key,
-            "name": name,
-            "intent_blacklist": intent_blacklist,
-            "skill_blacklist": skill_blacklist,
-            "message_blacklist": message_blacklist,
-            "crypto_key": crypto_key,
-            "client_id": self.total_clients() + 1,
-            "is_admin": admin,
-            "password": password,
-            "allowed_types": allowed_types,
-        }
-        if metadata is not None:
-            client_data["metadata"] = dict(metadata)
-        user = Client(**client_data)
+        user = Client(
+            api_key=key,
+            name=name,
+            crypto_key=crypto_key,
+            client_id=self.total_clients() + 1,
+            is_admin=admin,
+            password=password,
+            allowed_types=allowed_types or [],
+            metadata=meta,
+        )
         return self.db.add_item(user)
 
     def update_item(self, client: Client):

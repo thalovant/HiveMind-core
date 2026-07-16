@@ -1,5 +1,6 @@
 permissions:
-  contents: read
+  contents: write
+  pull-requests: write
 
 name: Code Coverage
 
@@ -10,38 +11,9 @@ on:
 
 jobs:
   coverage:
-    name: coverage (3.14)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-
-      - name: Set up Python 3.14
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.14"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pytest pytest-cov coverage[toml]
-          python -m pip install "hivescope @ git+https://github.com/JarbasHiveMind/hivescope@1ae22f9addbc60d7aeae111636868aba0710760c"
-          python -m pip install -e .
-
-      - name: Run tests with coverage
-        run: |
-          python -m pytest tests/e2e/ \
-            --cov=hivemind_core \
-            --cov-report=xml:coverage.xml \
-            --cov-report=term-missing \
-            --cov-report=json:coverage.json \
-            --cov-report=html \
-            -v
-
-      - name: Upload coverage artifact
-        if: always()
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
-        with:
-          name: coverage-report
-          path: coverage.xml
-          retention-days: 14
-          if-no-files-found: warn
+    uses: OpenVoiceOS/gh-automations/.github/workflows/coverage.yml@e1770fb608f8c39ab886ff336f6470ee17747b0d # dev
+    with:
+      python_version: '3.11'
+      coverage_source: 'hivemind_core'
+      test_path: 'tests/e2e/'
+      test_extras: 'test'

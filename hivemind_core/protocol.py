@@ -1,25 +1,14 @@
 # hivemind-core
 # Copyright (C) 2026 Casimiro Ferreira
-#
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU Affero General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU Affero General Public License for more details.
-#
-# You should have received a copy of the GNU Affero General Public License
-# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# SPDX-License-Identifier: Apache-2.0
 import dataclasses
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Any, Dict, Union, List, Optional, Callable, Literal
+from typing import Union, List, Optional, Callable, Literal
 
 import pybase64
 from ovos_bus_client import MessageBusClient
@@ -35,27 +24,55 @@ from hivemind_bus_client.encryption import (SupportedEncodings, SupportedCiphers
                                             decrypt_from_json, encrypt_as_json,
                                             decrypt_bin, encrypt_bin,
                                             _norm_encoding, _norm_cipher)
+try:
+    from hivemind_bus_client.noise import (NOISE_SUPPORTED, NOISE_PATTERNS, NOISE_SUITES,
+                                           NOISE_PATTERN_KK, NoiseTransport,
+                                           NoiseHandshakeFailed, NoiseTransportFailed,
+                                           build_prologue, noise_protocol_name,
+                                           start_noise_handshake)
+except ImportError:
+    # hivemind_bus_client without the protocol v3 noise module: the server
+    # degrades gracefully to the legacy (v2 and below) handshake and never
+    # advertises protocol v3. The stubs below are only referenced on code
+    # paths gated behind NOISE_SUPPORTED / an established v3 session.
+    NOISE_SUPPORTED = False
+    NOISE_PATTERNS, NOISE_SUITES = [], []
+    NOISE_PATTERN_KK = "KKpsk0"
+
+    class NoiseHandshakeFailed(Exception):
+        """Stub: protocol v3 unavailable."""
+
+    class NoiseTransportFailed(Exception):
+        """Stub: protocol v3 unavailable."""
+
+    class NoiseTransport:  # pragma: no cover - never instantiated without noise
+        def __init__(self, *args, **kwargs):
+            raise NoiseHandshakeFailed("protocol v3 (Noise) support unavailable: "
+                                       "hivemind_bus_client.noise not importable")
+
+    def build_prologue(*args, **kwargs):  # pragma: no cover
+        raise NoiseHandshakeFailed("protocol v3 (Noise) support unavailable")
+
+    def noise_protocol_name(*args, **kwargs):  # pragma: no cover
+        raise NoiseHandshakeFailed("protocol v3 (Noise) support unavailable")
+
+    def start_noise_handshake(*args, **kwargs):  # pragma: no cover
+        raise NoiseHandshakeFailed("protocol v3 (Noise) support unavailable")
 from hivemind_core.database import ClientDatabase
 from hivemind_bus_client.hive_map import HiveMapper
-from hivemind_plugin_manager.protocols import (AgentProtocol,
-                                               BinaryDataHandlerProtocol,
-                                               ClientCallbacks)
-try:
-    from hivemind_plugin_manager.protocols import (PolicyContext,
-                                                   PolicyDecision,
-                                                   PolicyProtocol)
-except ImportError:
-    PolicyContext = None
-    PolicyDecision = None
-    PolicyProtocol = Any
+from hivemind_plugin_manager.protocols import AgentProtocol, BinaryDataHandlerProtocol, ClientCallbacks
+from hivemind_plugin_manager.database import Client
+from hivemind_plugin_manager.policy import PolicyPlugin
+from hivemind_core.policy import PolicyChain
 from poorman_handshake import HandShake, PasswordHandShake
-from poorman_handshake.asymmetric.utils import decrypt_RSA, load_RSA_key
+from poorman_handshake.asymmetric.utils import decrypt_RSA, load_RSA_key, verify_RSA
 
 
 class ProtocolVersion(IntEnum):
     ZERO = 0  # json only, no handshake, no binary
     ONE = 1  # handshake https://github.com/JarbasHiveMind/HiveMind-core/pull/29
     TWO = 2  # binary https://github.com/JarbasHiveMind/hivemind_websocket_client/pull/4
+    THREE = 3  # Noise handshake, always-encrypted session (HIVEMIND-CRYPTO-1 §3.4)
 
 
 class HiveMindNodeType(str, Enum):
@@ -77,6 +94,30 @@ class HiveMindNodeType(str, Enum):
     # but receiving connections
 
 
+# QUERY/CASCADE answers stream as a sequence of response chunks terminated by a
+# response wrapping this control message — the end-of-stream is part of the
+# protocol content, not loose metadata.
+QUERY_STREAM_END = "hive.query.complete"
+
+
+def _non_negative_float(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed >= 0 else default
+
+
+class UnencryptedMessageError(ValueError):
+    """Raised when a cleartext frame arrives on a connection that requires crypto.
+
+    Only HELLO and HANDSHAKE messages may travel unencrypted (they precede
+    session-key establishment); any other cleartext frame on a
+    ``crypto_required`` server is rejected and the client disconnected
+    (HIVEMIND-CRYPTO-1 §4).
+    """
+
+
 @dataclass
 class HiveMindClientConnection:
     """represents a connection to the hivemind listener"""
@@ -93,18 +134,12 @@ class HiveMindClientConnection:
     crypto_key: Optional[str] = None
     pub_key: Optional[str] = None  # TODO add field to database
 
-    msg_blacklist: List[str] = field(
-        default_factory=list
-    )  # list of ovos message_type to never be sent to this client
-    skill_blacklist: List[str] = field(
-        default_factory=list
-    )  # list of skill_id that can't match for this client
-    intent_blacklist: List[str] = field(
-        default_factory=list
-    )  # list of skill_id:intent_name that can't match for this client
-    allowed_types: List[str] = field(
-        default_factory=list
-    )  # list of ovos message_type to allow to be sent from this client
+    # admission whitelist — list of ovos message_type values this client
+    # may inject onto the agent bus. Enforced by MessageTypeACLPolicy
+    # (hivemind_core.policy.MessageTypeACLPolicy). Empty = deny everything.
+    # This is the only ACL field on the connection. There is no message
+    # blacklist by design: hivemind-core is whitelist-only, deny-by-default.
+    allowed_types: List[str] = field(default_factory=list)
     binarize: bool = False
     site_id: str = "unknown"
     can_escalate: bool = True
@@ -117,6 +152,51 @@ class HiveMindClientConnection:
     cipher: Literal[SupportedCiphers] = SupportedCiphers.AES_GCM
     encoding: Literal[SupportedEncodings] = SupportedEncodings.JSON_HEX
 
+    # protocol v3 (Noise handshake) state — HIVEMIND-CRYPTO-1 §3.4. On a v3
+    # connection ``noise_transport`` replaces ``crypto_key`` as the session
+    # layer; both stay None on v2-and-below connections (legacy path untouched)
+    noise_handshake: Optional[object] = field(default=None, repr=False)
+    noise_transport: Optional[NoiseTransport] = field(default=None, repr=False)
+    # exact payloads of the cleartext HELLO + parameter HANDSHAKE sent to this
+    # client, retained for Noise prologue binding (CRYPTO-1 §3.4.3)
+    _hello_payload: Optional[dict] = field(default=None, init=False, repr=False)
+    _handshake_payload: Optional[dict] = field(default=None, init=False, repr=False)
+
+    # Connection-scoped resolved-user cache. Policies call ``resolve_user``
+    # which hits the DB at most once per ``ttl`` window; ``invalidate_user``
+    # forces the next call to refetch. Avoids per-policy DB sync() storms
+    # on the admission hot path. Not part of the public field set.
+    _resolved_user: Optional[Client] = field(default=None, init=False, repr=False)
+    _resolved_user_ts: float = field(default=0.0, init=False, repr=False)
+
+    def resolve_user(self, db, ttl: float = 5.0,
+                     force: bool = False) -> Optional[Client]:
+        """Return the cached DB row for this connection, refetching at
+        most every ``ttl`` seconds (or unconditionally when ``force``).
+
+        Looks up by ``client_id`` (via ``db.refresh``) when available,
+        falling back to the api-key path otherwise. Exceptions from the
+        DB propagate — callers fail-closed.
+        """
+        if (not force
+                and self._resolved_user is not None
+                and time.time() - self._resolved_user_ts <= ttl):
+            return self._resolved_user
+        client_id = getattr(self._resolved_user, "client_id", None)
+        if client_id is not None:
+            user = db.refresh(client_id)
+        else:
+            user = db.get_client_by_api_key(self.key)
+        self._resolved_user = user
+        self._resolved_user_ts = time.time()
+        return self._resolved_user
+
+    def invalidate_user(self) -> None:
+        """Drop the cached resolved user so the next ``resolve_user`` call
+        forces a fresh DB lookup."""
+        self._resolved_user = None
+        self._resolved_user_ts = 0.0
+
     def __post_init__(self):
         self.handshake = self.handshake or HandShake(self.hm_protocol.identity.private_key)
 
@@ -128,22 +208,26 @@ class HiveMindClientConnection:
 
     def send(self, message: HiveMessage):
         is_bin = message.msg_type == HiveMessageType.BINARY
-        # TODO some cleaning around HiveMessage
-        if not is_bin:
-            if isinstance(message.payload, dict):
-                _msg_type = message.payload.get("type")
-            else:
-                _msg_type = message.payload.msg_type
-
-            if _msg_type in self.msg_blacklist:
-                LOG.debug(
-                    f"message type {_msg_type} is blacklisted for {self.peer}"
-                )
-                return
-            elif message.msg_type == HiveMessageType.BUS:
-                LOG.debug(f"mycroft_type {_msg_type}")
+        if not is_bin and message.msg_type == HiveMessageType.BUS:
+            _payload_type = (message.payload.get("type")
+                             if isinstance(message.payload, dict)
+                             else message.payload.msg_type)
+            LOG.debug(f"mycroft_type {_payload_type}")
 
         LOG.debug(f"sending to {self.peer}: {message.msg_type}")
+
+        if self.noise_transport is not None:
+            # protocol v3: every message (HELLO/HANDSHAKE included) is a Noise
+            # transport message — there is no cleartext v3 session (§3.4.5)
+            if self.binarize or is_bin:
+                payload = get_bitstring(hive_type=message.msg_type,
+                                        payload=message.payload,
+                                        hivemeta=message.metadata,
+                                        binary_type=message.bin_type).bytes
+            else:
+                payload = message.serialize()
+            self.send_msg(self.noise_transport.encrypt_frame(payload), True)
+            return
 
         if self.crypto_key and message.msg_type not in [
             HiveMessageType.HANDSHAKE,
@@ -158,9 +242,10 @@ class HiveMindClientConnection:
                 payload = encrypt_bin(key=self.crypto_key, plaintext=payload, cipher=self.cipher)
                 is_bin = True
             else:
-                LOG.debug(f"unencrypted payload size: {len(message.payload.serialize())} bytes")
+                plaintext = message.serialize()
+                LOG.debug(f"unencrypted payload size: {len(plaintext)} bytes")
                 payload = encrypt_as_json(
-                    key=self.crypto_key, plaintext=message.serialize(),
+                    key=self.crypto_key, plaintext=plaintext,
                     cipher=self.cipher, encoding=self.encoding
                 )  # json string
             LOG.debug(f"encrypted payload size: {len(payload)} bytes")
@@ -170,39 +255,118 @@ class HiveMindClientConnection:
 
         self.send_msg(payload, is_bin)
 
+    @property
+    def crypto_required(self) -> bool:
+        """True when the listener this connection belongs to mandates encryption.
+
+        Mirrors the ``crypto_required`` flag advertised to clients in the
+        HANDSHAKE payload (``HiveMindListenerProtocol.require_crypto``).
+        """
+        return bool(self.hm_protocol and self.hm_protocol.require_crypto)
+
     def decode(self, payload: str) -> HiveMessage:
-        if self.crypto_key:
+        encrypted = False
+        if self.noise_transport is not None:
+            # protocol v3 session: only valid Noise transport messages are
+            # accepted; tampering/replay/reordering fails AEAD and is fatal
+            if not isinstance(payload, bytes):
+                self.disconnect()
+                raise NoiseTransportFailed(
+                    "non-Noise message received on a protocol v3 session")
+            try:
+                payload = self.noise_transport.decrypt_frame(payload)
+            except NoiseTransportFailed:
+                LOG.error(f"rejecting invalid Noise transport message from "
+                          f"{self.peer} (tampered, replayed or out-of-order), "
+                          "disconnecting")
+                self.disconnect()
+                raise
+            # a decoded Noise transport frame is authenticated + encrypted
+            encrypted = True
+        elif self.crypto_key:
             # handle binary encryption
             if isinstance(payload, bytes):
                 payload = decrypt_bin(key=self.crypto_key, ciphertext=payload,
                                       cipher=self.cipher)
+                encrypted = True
             # handle json encryption
             elif "ciphertext" in payload:
                 payload = decrypt_from_json(key=self.crypto_key, ciphertext_json=payload,
                                             encoding=self.encoding, cipher=self.cipher)
+                encrypted = True
             else:
                 LOG.warning("Message was unencrypted")
-                # TODO - some error if crypto is required
-        else:
-            pass  # TODO - reject anything except HELLO and HANDSHAKE
 
         if isinstance(payload, bytes):
-            return decode_bitstring(payload)
-        elif isinstance(payload, str):
-            payload = json.loads(payload)
-        return HiveMessage(**payload)
+            message = decode_bitstring(payload)
+        else:
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            message = HiveMessage(**payload)
+
+        # HIVEMIND-CRYPTO-1 §4 - when the server requires crypto, drop any
+        # cleartext frame that is not part of key establishment. HELLO and
+        # HANDSHAKE MUST remain accepted in the clear (they precede the
+        # session key); everything else is rejected and the client dropped.
+        if (not encrypted
+                and self.crypto_required
+                and message.msg_type not in (HiveMessageType.HELLO,
+                                             HiveMessageType.HANDSHAKE)):
+            LOG.error(f"Dropping unencrypted {message.msg_type} message from "
+                      f"{self.peer}: server requires crypto")
+            self.disconnect()
+            raise UnencryptedMessageError(
+                f"unencrypted {message.msg_type} message rejected: "
+                f"crypto is required")
+        return message
 
     def authorize(self, message: Message) -> bool:
-        """parse the message being injected into ovos-core bus
-        if this client is not authorized to inject it return False"""
-        if message.msg_type not in self.allowed_types:
-            return False
+        """Subclass override hook — return False to short-circuit bus
+        injection without going through the policy chain.
 
-        # TODO check intent / skill that will trigger
+        The allowed_types whitelist that used to live here moved to
+        MessageTypeACLPolicy in hivemind_core/policy.py (see #85). Kept as a
+        default-True stub so subclasses overriding it for ad-hoc
+        admission gates continue to work.
+        """
+        # legacy hooks: subclasses may still want to plug intent / skill
+        # decisions here outside the policy chain
         # for OVOS agent this is passed in Session and ignored during match
         # adding it here allows blocking the utterance completely instead
         # or adding a callback for specific agents to decide how to handle
         return True
+
+
+@dataclass
+class CascadeResponse:
+    """A single response collected during a CASCADE query."""
+    responder_peer: str
+    responder_site_id: str = ""
+    messages: List[Message] = field(default_factory=list)
+    metadata: dict = field(default_factory=dict)
+
+
+@dataclass
+class CascadeCollector:
+    """Collects CASCADE responses for a given query_id at the originator."""
+    query_id: str
+    originator_peer: str
+    responses: List[CascadeResponse] = field(default_factory=list)
+
+    def add_response(self, message: HiveMessage) -> 'CascadeResponse':
+        meta = message.metadata or {}
+        resp = CascadeResponse(
+            responder_peer=meta.get("responder_peer", "unknown"),
+            responder_site_id=meta.get("responder_site_id", ""),
+            metadata=meta,
+        )
+        inner = message.payload
+        if isinstance(inner, HiveMessage) and inner.msg_type == HiveMessageType.BUS:
+            bus_msg = inner.payload
+            if isinstance(bus_msg, Message):
+                resp.messages.append(bus_msg)
+        self.responses.append(resp)
+        return resp
 
 
 @dataclass
@@ -216,9 +380,9 @@ class HiveMindListenerProtocol:
     identity: NodeIdentity = dataclasses.field(default_factory=NodeIdentity)
     db: ClientDatabase = dataclasses.field(default_factory=ClientDatabase)
     callbacks: ClientCallbacks = dataclasses.field(default_factory=ClientCallbacks)
-    policy_protocols: List[PolicyProtocol] = dataclasses.field(default_factory=list)
 
     hive_mapper: HiveMapper = dataclasses.field(default_factory=HiveMapper)
+    policy_chain: Optional[PolicyChain] = None
 
     # below are optional callbacks to handle payloads
     # receives the payload + HiveMindClient that sent it
@@ -228,10 +392,27 @@ class HiveMindListenerProtocol:
     broadcast_callback = None  # slave asked to broadcast payload
     agent_bus_callback = None  # slave asked to inject payload into mycroft bus
     shared_bus_callback = None  # passive sharing of slave device bus (info)
+    _upstream_hm = None  # HiveMessageBusClient to the upstream master when this node relays
+    cascade_select_callback = None  # (query_id, [CascadeResponse]) -> Optional[Message]; CASCADE disambiguation
+    query_timeout = 8.0  # seconds to wait for the local agent to answer a QUERY/CASCADE
+    default_lang = "en-US"
 
     def __post_init__(self):
         self.clients = {}
+        # TOFU pinning store for INTERCOM origin authentication
+        # (HIVEMIND-CRYPTO-1 §5). Maps a client's access key to the PEM
+        # public key it presented; once pinned, INTERCOM signatures from that
+        # client MUST verify against the pinned key. In-memory for now — pins
+        # last for the lifetime of this listener (the Client DB model has no
+        # pubkey column yet).
+        self.trusted_pubkeys: dict = {}  # client.key -> PEM public key
         self._seen_flood_ids: set = set()
+        self._pending_cascades: dict = {}  # query_id -> CascadeCollector
+        self._last_seen_updates: dict = {}  # client.key -> last persisted timestamp
+        self.last_seen_update_interval = _non_negative_float(
+            get_server_config().get("last_seen_update_interval", 0),
+            0.0,
+        )
         self.agent_protocol.hm_protocol = self
         if not self.binary_data_protocol:
             # just logs received messages
@@ -239,163 +420,45 @@ class HiveMindListenerProtocol:
                                                                   agent_protocol=self.agent_protocol)
         else:
             self.binary_data_protocol.hm_protocol = self
-        for policy in self.policy_protocols:
-            policy.hm_protocol = self
+        if self.policy_chain is None:
+            from hivemind_core.policy import MessageTypeACLPolicy, DenyAllPolicy
+            cfg = get_server_config()
+            try:
+                chain = PolicyChain.from_config(cfg, hm_protocol=self)
+            except Exception:
+                LOG.exception(
+                    "failed to build policy chain; installing DenyAllPolicy "
+                    "fallback — every admission will be rejected until "
+                    "configuration is fixed"
+                )
+                self.policy_chain = PolicyChain(
+                    policies=[DenyAllPolicy(hm_protocol=self)],
+                )
+            else:
+                # MessageTypeACLPolicy is the canonical allowed_types whitelist
+                # enforcement and is non-removable. Prepend it to the
+                # configured chain (deduping if an operator listed it
+                # explicitly). Always mandatory — _optional[0] = False.
+                configured: List[PolicyPlugin] = []
+                configured_optional: List[bool] = []
+                for i, p in enumerate(chain.policies):
+                    if isinstance(p, MessageTypeACLPolicy):
+                        continue
+                    configured.append(p)
+                    configured_optional.append(
+                        chain._optional[i] if i < len(chain._optional) else False
+                    )
+                self.policy_chain = PolicyChain(
+                    policies=[MessageTypeACLPolicy(hm_protocol=self), *configured],
+                    _optional=[False, *configured_optional],
+                )
 
     def get_bus(self, client: HiveMindClientConnection) -> Union[FakeBus, MessageBusClient]:
-        # allow subclasses to use dedicated bus per client
-        return self.agent_protocol.bus
-
-    def _get_client_user(self, client: HiveMindClientConnection):
-        self.db.sync()
-        user = self.db.get_client_by_api_key(client.key)
-        if user is None:
-            LOG.warning(f"No database user found for connected client: {client.peer}")
-        return user
-
-    @staticmethod
-    def _merge_policy_patch(target: Dict[str, Any], patch: Dict[str, Any]):
-        for key, value in patch.items():
-            if isinstance(value, dict) and isinstance(target.get(key), dict):
-                HiveMindListenerProtocol._merge_policy_patch(target[key], value)
-            elif isinstance(value, list) and isinstance(target.get(key), list):
-                for item in value:
-                    if item not in target[key]:
-                        target[key].append(item)
-            else:
-                target[key] = value
-
-    def _make_policy_context(self, client: HiveMindClientConnection, user=None) -> PolicyContext:
-        if PolicyContext is None:
-            raise RuntimeError("Policy support requires hivemind-plugin-manager with hivemind.policy support")
-        user = user or self._get_client_user(client)
-        return PolicyContext(
-            client=client,
-            user=user,
-        )
-
-    def _policy_exception_decision(self, policy: PolicyProtocol, hook_name: str) -> PolicyDecision:
-        LOG.exception(f"Policy '{policy.__class__.__name__}' failed in {hook_name}")
-        if get_server_config().get("policy_fail_closed", True):
-            if PolicyDecision is None:
-                raise RuntimeError("Policy support requires hivemind-plugin-manager with hivemind.policy support")
-            return PolicyDecision(
-                allowed=False,
-                reason="policy check failed",
-                code="policy_error",
-                data={"policy": policy.__class__.__name__, "hook": hook_name},
-            )
-        return PolicyDecision()
-
-    def _send_policy_denied(self,
-                            client: HiveMindClientConnection,
-                            decision: PolicyDecision,
-                            request: Optional[Message] = None):
-        data = dict(decision.data or {})
-        if decision.reason:
-            data.setdefault("reason", decision.reason)
-        if decision.code:
-            data.setdefault("code", decision.code)
-        data.setdefault("peer", client.peer)
-        if request is not None:
-            data.setdefault("request_type", request.msg_type)
-
-        response = Message(
-            decision.message_type or "hive.policy.denied",
-            data,
-            {
-                "source": self.peer,
-                "destination": client.peer,
-                "session": client.sess.serialize(),
-            },
-        )
-        client.send(HiveMessage(HiveMessageType.BUS, response))
-
-    def _apply_policy_decision(self,
-                               decision: Optional[PolicyDecision],
-                               client: HiveMindClientConnection,
-                               message: Optional[Message] = None) -> bool:
-        if decision is None:
-            return True
-        if message is not None and decision.context_patch:
-            if not isinstance(message.context, dict):
-                message.context = {}
-            self._merge_policy_patch(message.context, decision.context_patch)
-        if decision.allowed:
-            return True
-
-        LOG.warning(f"{client.peer} denied by policy: {decision.reason or decision.code}")
-        self._send_policy_denied(client, decision, message)
-        return False
-
-    def _authorize_hive_message_policies(self,
-                                         message: HiveMessage,
-                                         client: HiveMindClientConnection,
-                                         user=None) -> bool:
-        if not self.policy_protocols:
-            return True
-        context = self._make_policy_context(client, user)
-        request = message.payload if isinstance(message.payload, Message) else None
-        for policy in self.policy_protocols:
-            try:
-                decision = policy.authorize_hive_message(message, context)
-            except Exception:
-                decision = self._policy_exception_decision(policy, "authorize_hive_message")
-            if not self._apply_policy_decision(decision, client, request):
-                return False
-            if decision and decision.stop_processing:
-                break
-        return True
-
-    def _authorize_binary_payload_policies(self,
-                                           message: HiveMessage,
-                                           client: HiveMindClientConnection,
-                                           user=None) -> bool:
-        if not self.policy_protocols:
-            return True
-        context = self._make_policy_context(client, user)
-        for policy in self.policy_protocols:
-            try:
-                decision = policy.authorize_binary_payload(message, context)
-            except Exception:
-                decision = self._policy_exception_decision(policy, "authorize_binary_payload")
-            if not self._apply_policy_decision(decision, client):
-                return False
-            if decision and decision.stop_processing:
-                break
-        return True
-
-    def _authorize_bus_message_policies(self,
-                                        message: Message,
-                                        client: HiveMindClientConnection,
-                                        user=None) -> bool:
-        if not self.policy_protocols:
-            return True
-        context = self._make_policy_context(client, user)
-        for policy in self.policy_protocols:
-            try:
-                decision = policy.authorize_bus_message(message, context)
-            except Exception:
-                decision = self._policy_exception_decision(policy, "authorize_bus_message")
-            if not self._apply_policy_decision(decision, client, message):
-                return False
-            if decision and decision.stop_processing:
-                break
-        return True
-
-    def _record_bus_message_policies(self,
-                                     message: Message,
-                                     client: HiveMindClientConnection,
-                                     user=None,
-                                     result: Optional[Any] = None):
-        if not self.policy_protocols:
-            return
-        context = self._make_policy_context(client, user)
-        for policy in self.policy_protocols:
-            try:
-                policy.record_bus_message(message, context, result=result)
-            except Exception:
-                LOG.exception(f"Policy '{policy.__class__.__name__}' failed in record_bus_message")
+        # The agent decides which bus a client's messages land on. Default
+        # agents return their single shared bus; a multiplexing agent (one
+        # isolated brain per access key) returns a per-client bus, so per-key
+        # routing on the inject path stays transparent here.
+        return self.agent_protocol.get_bus(client)
 
     def handle_new_client(self, client: HiveMindClientConnection):
         try:
@@ -424,22 +487,49 @@ class HiveMindListenerProtocol:
         bus = self.get_bus(client)
         bus.emit(message)
 
-        min_version = (
+        crypto_min = (
             ProtocolVersion.ONE
             if client.crypto_key is None and self.require_crypto
             else ProtocolVersion.ZERO
         )
-        max_version = ProtocolVersion.ONE
+        # deployment-configured protocol floor (HIVEMIND-WIRE-1 §2); default 2
+        # refuses the oldest json-only / no-binary clients. The advertised
+        # minimum is the stricter of the configured floor and the crypto-derived
+        # minimum.
+        try:
+            cfg_min = ProtocolVersion(int(get_server_config().get("min_protocol_version", 2)))
+        except (ValueError, KeyError):
+            cfg_min = ProtocolVersion.TWO
+        min_version = ProtocolVersion(max(int(cfg_min), int(crypto_min)))
 
-        msg = HiveMessage(
-            HiveMessageType.HELLO,
-            payload={
-                "pubkey": client.handshake.pubkey,
-                # allows any node to verify messages are signed with this
-                "peer": client.peer,  # this identifies the connected client in ovos message.context
-                "node_id": self.peer
-            },
-        )
+        # protocol v3 (Noise handshake) needs the noise primitive and a shared
+        # password for the PSK; binary framing (v2) needs binarization enabled;
+        # otherwise the connection tops out at the legacy handshake (v1).
+        v3_capable = NOISE_SUPPORTED and client.pswd_handshake is not None
+        if v3_capable:
+            max_version = ProtocolVersion.THREE
+        elif get_server_config().get("binarize", False):
+            max_version = ProtocolVersion.TWO
+        else:
+            max_version = ProtocolVersion.ONE
+
+        if min_version > max_version:
+            LOG.warning(
+                f"rejecting {client.peer}: server requires protocol version "
+                f">= {int(min_version)} but this connection can offer at most "
+                f"{int(max_version)}"
+            )
+            client.disconnect()
+            return
+
+        hello_payload = {
+            "pubkey": client.handshake.pubkey,
+            # allows any node to verify messages are signed with this
+            "peer": client.peer,  # this identifies the connected client in ovos message.context
+            "node_id": self.peer
+        }
+        client._hello_payload = hello_payload  # bound into the Noise prologue
+        msg = HiveMessage(HiveMessageType.HELLO, payload=hello_payload)
         LOG.debug(f"saying HELLO to: {client.peer}")
         client.send(msg)
 
@@ -463,6 +553,15 @@ class HiveMindListenerProtocol:
             "encodings": allowed_encodings,
             "ciphers": allowed_ciphers
         }
+        if v3_capable:
+            # advertise supported Noise patterns/suites, preference ordered
+            # (CRYPTO-1 §3.4.1/§3.4.2). KKpsk0 only when this client's static
+            # key was pinned by a previous XXpsk2 handshake.
+            patterns = list(NOISE_PATTERNS)
+            if not self._get_pinned_client_noise_key(client):
+                patterns = [p for p in patterns if p != NOISE_PATTERN_KK]
+            payload["noise"] = {"patterns": patterns, "suites": list(NOISE_SUITES)}
+        client._handshake_payload = payload  # bound into the Noise prologue
         msg = HiveMessage(HiveMessageType.HANDSHAKE, payload)
         LOG.debug(f"starting {client.peer} HANDSHAKE: {payload}")
         client.send(msg)
@@ -471,11 +570,25 @@ class HiveMindListenerProtocol:
 
     def update_last_seen(self, client: HiveMindClientConnection):
         """track timestamps of last client interaction"""
+        update_interval = getattr(self, "last_seen_update_interval", 0)
+        mono_now = None
+        if update_interval > 0:
+            mono_now = time.monotonic()
+            last_update = self._last_seen_updates.get(client.key)
+            if last_update is not None and mono_now - last_update < update_interval:
+                return
         with self.db:
             user = self.db.get_client_by_api_key(client.key)
+            if user is None:
+                # key was revoked / never existed — nothing to update
+                LOG.debug(f"can not update last seen, no client for key: {client.key}")
+                self._last_seen_updates.pop(client.key, None)
+                return
             user.last_seen = time.time()
             LOG.debug(f"updated last seen timestamp: {client.key} - {user.last_seen}")
             self.db.update_item(user)
+            if mono_now is not None:
+                self._last_seen_updates[client.key] = mono_now
 
     def handle_client_disconnected(self, client: HiveMindClientConnection):
         try:
@@ -495,6 +608,8 @@ class HiveMindListenerProtocol:
 
         if client.peer in self.clients:
             self.clients.pop(client.peer)
+        if not any(conn.key == client.key for conn in self.clients.values()):
+            self._last_seen_updates.pop(client.key, None)
         client.disconnect()
         message = Message(
             "hive.client.disconnect",
@@ -565,11 +680,6 @@ class HiveMindListenerProtocol:
         message.update_source_peer(client.peer)
 
         message.update_hop_data()
-        user = None
-        if self.policy_protocols and message.msg_type not in [HiveMessageType.HANDSHAKE, HiveMessageType.HELLO]:
-            user = self._get_client_user(client)
-            if not self._authorize_hive_message_policies(message, client, user):
-                return
 
         if message.msg_type == HiveMessageType.HANDSHAKE:
             self.handle_handshake_message(message, client)
@@ -589,6 +699,10 @@ class HiveMindListenerProtocol:
             self.handle_broadcast_message(message, client)
         elif message.msg_type == HiveMessageType.ESCALATE:
             self.handle_escalate_message(message, client)
+        elif message.msg_type == HiveMessageType.QUERY:
+            self.handle_query_message(message, client)
+        elif message.msg_type == HiveMessageType.CASCADE:
+            self.handle_cascade_message(message, client)
         elif message.msg_type == HiveMessageType.INTERCOM:
             self.handle_intercom_message(message, client)
         elif message.msg_type == HiveMessageType.BINARY:
@@ -612,11 +726,30 @@ class HiveMindListenerProtocol:
             self, message: HiveMessage, client: HiveMindClientConnection
     ):
         assert message.msg_type == HiveMessageType.BINARY
-        if self.policy_protocols:
-            user = self._get_client_user(client)
-            if not self._authorize_binary_payload_policies(message, client, user):
-                return
         bin_data = message.payload
+
+        # policy admission chain — issue #85
+        verdict = self.policy_chain.review_binary(bin_data, client)
+        if verdict.denied:
+            LOG.info(f"policy denied binary payload from {client.peer}: "
+                     f"{verdict.code} ({verdict.reason})")
+            denied = Message(
+                "hive.policy.denied",
+                {
+                    "denied_type": "binary",
+                    "bin_type": str(getattr(message, "bin_type", "")),
+                    "code": verdict.code,
+                    "reason": verdict.reason,
+                    "data": verdict.data,
+                },
+                {"source": "hivemind-core", "destination": client.peer},
+            )
+            try:
+                client.send(HiveMessage(HiveMessageType.BUS, payload=denied))
+            except Exception:
+                LOG.exception("failed to send hive.policy.denied for binary")
+            return
+
         if message.bin_type == HiveMindBinaryPayloadType.RAW_AUDIO:
             sr = message.metadata.get("sample_rate", 16000)
             sw = message.metadata.get("sample_width", 2)
@@ -638,7 +771,14 @@ class HiveMindListenerProtocol:
             self.binary_data_protocol.handle_receive_tts(bin_data, utt, lang, file_name, client)
         elif message.bin_type == HiveMindBinaryPayloadType.FILE:
             file_name = message.metadata.get("file_name")
-            self.binary_data_protocol.handle_receive_file(bin_data, file_name, client)
+            # SECURITY: file_name is client-supplied. Strip any directory
+            # components so a malicious peer can not escape the intended
+            # download directory (eg. "../../etc/passwd" -> "passwd").
+            safe_name = os.path.basename(file_name) if file_name else ""
+            if not safe_name or safe_name in (".", ".."):
+                LOG.warning(f"Rejecting binary FILE with unsafe file_name: {file_name!r}")
+                return
+            self.binary_data_protocol.handle_receive_file(bin_data, safe_name, client)
         elif message.bin_type == HiveMindBinaryPayloadType.NUMPY_IMAGE:
             # TODO - convert to numpy array
             camera_id = message.metadata.get("camera_id")
@@ -646,9 +786,144 @@ class HiveMindListenerProtocol:
         else:
             LOG.warning(f"Ignoring received untyped binary data: {len(bin_data)} bytes")
 
+    # ------------------------------------------------- protocol v3 (Noise)
+    def _get_pinned_client_noise_key(self, client: HiveMindClientConnection) -> Optional[str]:
+        """Pinned Noise static public key for this client identity, if any.
+
+        Pins live in the client database row's metadata (TOFU-then-pin,
+        CRYPTO-1 §3.4.5). Failures are treated as 'not pinned'.
+        """
+        try:
+            with self.db:
+                user = self.db.get_client_by_api_key(client.key)
+            if user is not None:
+                return (user.metadata or {}).get("noise_pubkey")
+        except Exception:
+            LOG.exception("failed to look up pinned noise key")
+        return None
+
+    def _pin_client_noise_key(self, client: HiveMindClientConnection, pubkey: str) -> None:
+        """Persist a client's Noise static public key against its identity."""
+        try:
+            with self.db:
+                user = self.db.get_client_by_api_key(client.key)
+                if user is None:
+                    return
+                user.metadata = user.metadata or {}
+                user.metadata["noise_pubkey"] = pubkey
+                self.db.update_item(user)
+        except Exception:
+            LOG.exception("failed to pin client noise key")
+
+    def _abort_noise_handshake(self, client: HiveMindClientConnection, reason: str):
+        """Fatal Noise handshake failure — reject the connection (§3.4.3)."""
+        LOG.error(f"protocol v3 handshake with {client.peer} FAILED: {reason}")
+        client.noise_handshake = None
+        client.noise_transport = None
+        self.handle_invalid_key_connected(client)
+        client.disconnect()
+
+    def handle_noise_handshake_message(
+            self, message: HiveMessage, client: HiveMindClientConnection
+    ):
+        """Server side of the protocol v3 Noise handshake (CRYPTO-1 §3.4.3).
+
+        The node is the Noise initiator; this server is the responder. Noise
+        message 1 names the selected pattern/suite and starts the handshake;
+        for XXpsk2 a final message 3 authenticates the node's static key.
+        A wrong password (PSK), tampered negotiation (prologue mismatch) or
+        pinned-key contradiction aborts cryptographically, fail-fast.
+        """
+        noise_params = message.payload.get("noise") or {}
+        try:
+            noise_msg = bytes.fromhex(noise_params["msg"])
+        except (KeyError, TypeError, ValueError):
+            self._abort_noise_handshake(client, "malformed Noise envelope")
+            return
+
+        if client.noise_handshake is None:
+            # Noise message 1: fixes the Noise protocol name
+            offered = (client._handshake_payload or {}).get("noise") or {}
+            pattern = noise_params.get("pattern")
+            suite = noise_params.get("suite")
+            if pattern not in (offered.get("patterns") or []) or \
+                    suite not in (offered.get("suites") or []):
+                self._abort_noise_handshake(
+                    client, f"pattern/suite not offered: {pattern}/{suite}")
+                return
+            pinned = self._get_pinned_client_noise_key(client)
+            if pattern == NOISE_PATTERN_KK and not pinned:
+                self._abort_noise_handshake(client, "KKpsk0 without a pinned key")
+                return
+            name = noise_protocol_name(pattern, suite)
+            prologue = build_prologue(client._hello_payload or {},
+                                      client._handshake_payload or {}, name)
+            try:
+                client.noise_handshake = start_noise_handshake(
+                    initiator=False, pattern=pattern, suite=suite,
+                    password=client.pswd_handshake.password,
+                    node_id=self.peer, prologue=prologue,
+                    key_path=self.identity.noise_key,
+                    remote_pubkey=pinned if pattern == NOISE_PATTERN_KK else None)
+                node_payload = json.loads(
+                    client.noise_handshake.read_message(noise_msg) or b"{}")
+                # honour the node's binarize capability; encodings are framing
+                # negotiation only — a v3 session is encrypted by the Noise
+                # CipherStates regardless of encoding (WIRE-1 §3)
+                client.binarize = bool(node_payload.get("binarize", False))
+                encodings = [_norm_encoding(e) for e in
+                             node_payload.get("encodings") or []] or [SupportedEncodings.JSON_HEX]
+                client.encoding = encodings[0]
+                msg2 = client.noise_handshake.write_message(
+                    json.dumps({"encoding": client.encoding}).encode("utf-8"))
+            except Exception as e:
+                self._abort_noise_handshake(client, f"handshake failure: {e}")
+                return
+            client.send(HiveMessage(HiveMessageType.HANDSHAKE,
+                                    {"noise": {"msg": msg2.hex()}}))
+            if not client.noise_handshake.handshake_finished:
+                return  # XXpsk2: wait for Noise message 3
+        else:
+            # XXpsk2 message 3: node's (encrypted) static key + final DH mix
+            try:
+                client.noise_handshake.read_message(noise_msg)
+            except Exception as e:
+                self._abort_noise_handshake(client, f"handshake failure: {e}")
+                return
+
+        # handshake complete -> Split(); transport CipherStates take over
+        try:
+            transport = NoiseTransport(client.noise_handshake)
+        except NoiseHandshakeFailed as e:
+            self._abort_noise_handshake(client, str(e))
+            return
+
+        # TOFU-then-pin the node's static key (§3.4.5)
+        pinned = self._get_pinned_client_noise_key(client)
+        if pinned and transport.remote_static_key != pinned:
+            self._abort_noise_handshake(
+                client, "client Noise static key contradicts pinned key")
+            return
+        if not pinned and transport.remote_static_key:
+            self._pin_client_noise_key(client, transport.remote_static_key)
+
+        client.noise_transport = transport
+        client.noise_handshake = None
+        client.crypto_key = None  # v3 replaces the v2 session AEAD entirely
+        LOG.info(f"protocol v3 Noise session established with {client.peer}")
+
     def handle_handshake_message(
             self, message: HiveMessage, client: HiveMindClientConnection
     ):
+        if "noise" in message.payload:
+            # protocol v3 negotiated (HIVEMIND-WIRE-1 §2)
+            if not NOISE_SUPPORTED or client.pswd_handshake is None or \
+                    not (client._handshake_payload or {}).get("noise"):
+                self._abort_noise_handshake(client, "protocol v3 not offered")
+                return
+            self.handle_noise_handshake_message(message, client)
+            return
+
         LOG.debug("handshake received, generating session key")
         if "pubkey" in message.payload and client.handshake is not None:
             pub = message.payload.pop("pubkey")
@@ -690,13 +965,19 @@ class HiveMindListenerProtocol:
 
             envelope = message.payload["envelope"]
             envelope_out = client.pswd_handshake.generate_handshake()
-            client.pswd_handshake.receive_handshake(envelope)
-
-            # if not client.pswd_handshake.receive_and_verify(envelope):
-            #     # TODO - different handles for invalid access key / invalid password
-            #     self.handle_invalid_key_connected(client)
-            #     client.disconnect()
-            #     return
+            # fail-fast: verify the client's envelope was built with the same
+            # password before deriving a key (HIVEMIND-CRYPTO-1 §3.2
+            # RECOMMENDED explicit reject). A wrong password previously only
+            # surfaced as a decrypt failure on the first encrypted frame.
+            try:
+                verified = client.pswd_handshake.receive_and_verify(envelope)
+            except Exception:
+                verified = False
+            if not verified:
+                LOG.warning("Client password handshake verification failed")
+                self.handle_invalid_key_connected(client)
+                client.disconnect()
+                return
 
             # key is derived safely from password in both sides
             # the handshake is validating both ends have the same password
@@ -733,6 +1014,16 @@ class HiveMindListenerProtocol:
         if "pubkey" in payload:
             client.pub_key = payload["pubkey"]
             LOG.debug(f"client sent public key")
+            # TOFU pin: first pubkey seen for this access key becomes the
+            # trust anchor for INTERCOM signature verification. A later HELLO
+            # presenting a different key does NOT overwrite the pin.
+            pinned = self.trusted_pubkeys.get(client.key)
+            if pinned is None:
+                self.trusted_pubkeys[client.key] = client.pub_key
+                LOG.debug(f"pinned public key for {client.peer}")
+            elif pinned != client.pub_key:
+                LOG.warning(f"client {client.peer} presented a public key that "
+                            f"does not match its pinned key; keeping the pin")
         else:
             LOG.warning(f"client did NOT send public key")
 
@@ -769,10 +1060,13 @@ class HiveMindListenerProtocol:
         sess = Session.from_message(payload)
         if sent_pipeline:
             sess.pipeline = raw_session.get("pipeline")
-        if sess.session_id == "default" and not client.is_admin:
-            LOG.warning("Client tried to inject 'default' session message, action only allowed for administrators!")
-            client.disconnect()
-            return
+        # The per-message "session_id == 'default'" gate moved to
+        # OVOSAgentPolicy.review (HiveMind-core#85). Non-admin clients
+        # injecting a default-session payload get Verdict.deny(
+        # "session_id_default_forbidden", ...) and the message is dropped
+        # with a hive.policy.denied response — replacing the previous
+        # severe `client.disconnect()` reaction. The HELLO-time check at
+        # handle_hello_message stays as connection-establishment gate.
 
         if sess.session_id != "default" and client.sess.session_id == sess.session_id:
             if not sent_pipeline:
@@ -794,7 +1088,8 @@ class HiveMindListenerProtocol:
             LOG.warning("Received broadcast message from downstream, illegal action")
             if self.illegal_callback:
                 self.illegal_callback(payload)
-            # TODO kick client for misbehaviour so it stops doing that?
+            # kick client for misbehaviour so it stops doing that
+            client.disconnect()
             return
 
         if self.broadcast_callback:
@@ -842,7 +1137,8 @@ class HiveMindListenerProtocol:
             LOG.warning("Received propagate message from downstream, illegal action")
             if self.illegal_callback:
                 self.illegal_callback(payload)
-            # TODO kick client for misbehaviour so it stops doing that?
+            # kick client for misbehaviour so it stops doing that
+            client.disconnect()
             return
 
         if self.propagate_callback:
@@ -867,18 +1163,8 @@ class HiveMindListenerProtocol:
                 continue
             self.clients[peer].send(payload)
 
-        # send to other masters
-        message = Message(
-            "hive.send.upstream",
-            payload,
-            {
-                "destination": "hive",
-                "source": self.peer,
-                "session": client.sess.serialize(),
-            },
-        )
-        bus = self.get_bus(client)
-        bus.emit(message)
+        # forward upstream to the master this node relays to (no-op at top level)
+        self.propagate_to_master(payload)
 
     def handle_ping_message(
             self, message: HiveMessage, client: HiveMindClientConnection
@@ -905,6 +1191,16 @@ class HiveMindListenerProtocol:
         # Always feed mapper (register sender info)
         self.hive_mapper.on_ping(message, received_at=time.time())
 
+        # Surface every observed PING on the agent bus (discovery/telemetry).
+        # Fires for satellite-originated and flood-cycle pings alike, before the
+        # dedup gate below.
+        self.agent_protocol.bus.emit(Message("hive.ping.received", {
+            "flood_id": flood_id,
+            "peer": ping_payload.get("peer"),
+            "site_id": ping_payload.get("site_id"),
+            "timestamp": ping_payload.get("timestamp"),
+        }))
+
         # Flood-loop prevention: if we already responded to this flood_id, stop
         if not flood_id or flood_id in self._seen_flood_ids:
             return
@@ -930,6 +1226,279 @@ class HiveMindListenerProtocol:
         for peer_id, conn in self.clients.items():
             conn.send(own_ping_outer)
 
+    def bind_upstream(self, slave) -> None:
+        """Bind a ``HiveMindSlaveProtocol`` as this node's upstream connection,
+        turning it into a relay: BROADCAST/PROPAGATE from the upstream master
+        are fanned out to downstream clients, and downstream PROPAGATE/ESCALATE
+        are forwarded upstream. ``slave`` must already be bound to a bus.
+        """
+        self._upstream_hm = slave.hm
+        slave.hm.on(HiveMessageType.BROADCAST, self.broadcast_from_master)
+        slave.hm.on(HiveMessageType.PROPAGATE, self.propagate_from_master)
+        slave.hm.on(HiveMessageType.QUERY, self.query_from_master)
+        slave.hm.on(HiveMessageType.CASCADE, self.cascade_from_master)
+
+    def broadcast_from_master(self, message: HiveMessage) -> None:
+        """Fan a BROADCAST received from the upstream master out to all
+        downstream clients."""
+        for peer, conn in self.clients.items():
+            conn.send(message)
+
+    def propagate_from_master(self, message: HiveMessage) -> None:
+        """Fan a PROPAGATE received from the upstream master out to all
+        downstream clients."""
+        for peer, conn in self.clients.items():
+            conn.send(message)
+
+    def escalate_to_master(self, payload: HiveMessage) -> None:
+        """Forward an ESCALATE upstream. No-op when this node is the top-level
+        master (nothing bound via :meth:`bind_upstream`)."""
+        if self._upstream_hm is None:
+            return
+        self._upstream_hm.emit(HiveMessage(HiveMessageType.ESCALATE, payload=payload))
+
+    def propagate_to_master(self, payload: HiveMessage) -> None:
+        """Forward a PROPAGATE upstream. No-op when this node is the top-level
+        master (nothing bound via :meth:`bind_upstream`)."""
+        if self._upstream_hm is None:
+            return
+        self._upstream_hm.emit(HiveMessage(HiveMessageType.PROPAGATE, payload=payload))
+
+    def query_from_master(self, message: HiveMessage) -> None:
+        """Fan a QUERY received from the upstream master out to downstream clients."""
+        for peer, conn in self.clients.items():
+            conn.send(message)
+
+    def query_to_master(self, payload: HiveMessage, metadata: Optional[dict] = None) -> None:
+        """Forward a QUERY upstream. No-op at the top-level master."""
+        if self._upstream_hm is None:
+            return
+        self._upstream_hm.emit(HiveMessage(HiveMessageType.QUERY, payload=payload,
+                                           metadata=metadata))
+
+    def _build_query_response(self, msg_type: HiveMessageType, response: Message,
+                              query_id: str, originator_peer: str,
+                              responder_peer: str,
+                              route: Optional[list] = None) -> HiveMessage:
+        """Wrap a *response* — one streamed ``speak``, or the
+        ``QUERY_STREAM_END`` control message that terminates the stream — as a
+        QUERY/CASCADE response HiveMessage."""
+        inner = HiveMessage(HiveMessageType.BUS, payload=response)
+        msg = HiveMessage(
+            msg_type, payload=inner,
+            metadata={
+                "query_id": query_id,
+                "originator_peer": originator_peer,
+                "responder_peer": responder_peer,
+                "is_response": True,
+            },
+        )
+        if route:
+            msg.replace_route(route)
+        return msg
+
+    def _admit_for_query(self, message: Message,
+                         client: HiveMindClientConnection) -> Optional[Message]:
+        """Policy-admit a QUERY/CASCADE inner bus message without injecting it
+        (the agent's ``natural_language_query`` does the answering). Returns the
+        admitted Message, or None if unauthorized / policy-denied."""
+        if not client.authorize(message):
+            LOG.warning(f"{client.peer} sent an unauthorized QUERY/CASCADE message")
+            return None
+        message = self._install_client_session(message, client)
+        if message.context.get("destination") is None:
+            message.context["destination"] = "skills"
+        verdict = self.policy_chain.review(message, client)
+        if verdict.denied:
+            LOG.info(f"policy denied QUERY '{message.msg_type}' from "
+                     f"{client.peer}: {verdict.code} ({verdict.reason})")
+            self._send_policy_denied(client, message, verdict)
+            return None
+        message.context["peer"] = message.context["source"] = client.peer
+        self.policy_chain.observe(message, client)
+        return message
+
+    def _answer_query_locally(self, message: HiveMessage,
+                              client: HiveMindClientConnection, query_id: str,
+                              originator_peer: str, msg_type: HiveMessageType,
+                              route, send_fn) -> bool:
+        """Stream a local-agent answer for a QUERY/CASCADE request. Extracts the
+        natural-language utterance, runs it through the policy admission gate,
+        then streams the agent's answer chunks via ``send_fn`` (one ``speak``
+        per chunk) followed by a ``QUERY_STREAM_END`` end-of-stream control message. Returns
+        True if the agent answered (caller stops), False if it declined (caller
+        escalates)."""
+        inner = message.payload
+        if inner.msg_type != HiveMessageType.BUS or not isinstance(inner.payload, Message):
+            return False
+        bus_msg = inner.payload
+        if bus_msg.msg_type != "recognizer_loop:utterance":
+            return False  # QUERY/CASCADE answer natural-language utterances only
+        admitted = self._admit_for_query(bus_msg, client)
+        if admitted is None:
+            return False
+        utts = admitted.data.get("utterances") or []
+        utterance = utts[0] if utts else ""
+        lang = (admitted.data.get("lang") or admitted.context.get("lang")
+                or self.default_lang)
+        if not utterance:
+            return False
+        answered = False
+        try:
+            for chunk in self.agent_protocol.answer_query(utterance, lang, client=client):
+                if chunk is None:
+                    break
+                answered = True
+                resp = Message("speak", {"utterance": chunk, "lang": lang},
+                               {"query_id": query_id})
+                send_fn(self._build_query_response(
+                    msg_type, resp, query_id, originator_peer, self.peer,
+                    route=route))
+        except NotImplementedError:
+            return False  # agent has no NL backend -> escalate
+        if answered:
+            send_fn(self._build_query_response(
+                msg_type, Message(QUERY_STREAM_END, {}), query_id,
+                originator_peer, self.peer, route=route))
+        return answered
+
+    def _route_query_response(self, message: HiveMessage,
+                              client: HiveMindClientConnection):
+        """Route a QUERY response downstream toward its originator (direct
+        client if connected here, else fan to downstream peers)."""
+        metadata = message.metadata or {}
+        originator_peer = metadata.get("originator_peer", "")
+        # CASCADE disambiguation: collect responses for a select callback at
+        # the originating node, letting it pick a winner progressively.
+        if (message.msg_type == HiveMessageType.CASCADE
+                and self.cascade_select_callback is not None
+                and originator_peer in self.clients):
+            query_id = metadata.get("query_id", "")
+            if query_id not in self._pending_cascades:
+                while len(self._pending_cascades) >= 256:  # bound the collector map
+                    self._pending_cascades.pop(next(iter(self._pending_cascades)))
+                self._pending_cascades[query_id] = CascadeCollector(
+                    query_id=query_id, originator_peer=originator_peer)
+            collector = self._pending_cascades[query_id]
+            collector.add_response(message)
+            bus = self.get_bus(self.clients[originator_peer])
+            try:
+                selected = self.cascade_select_callback(query_id, collector.responses)
+                if selected is not None:
+                    bus.emit(selected)
+                    del self._pending_cascades[query_id]
+            except Exception:
+                LOG.exception(f"cascade_select_callback error for query_id={query_id}")
+            return
+        # Default routing: forward toward the originator
+        if originator_peer in self.clients:
+            self.clients[originator_peer].send(message)
+            return
+        # route-aware return: send to the downstream hop on the path back to
+        # the originator (from the request's recorded route) instead of flooding
+        for hop in reversed(message.route or []):
+            src = hop.get("source")
+            if src and src != client.peer and src in self.clients:
+                self.clients[src].send(message)
+                return
+        # unknown return path: fan downstream (excluding the sender) as a last resort
+        for peer in self.clients:
+            if peer == client.peer:
+                continue
+            self.clients[peer].send(message)
+
+    def handle_query_message(self, message: HiveMessage,
+                             client: HiveMindClientConnection):
+        """QUERY — like ESCALATE but expects a response. Request: try the local
+        agent; if answered, reply downstream; else escalate upstream (or return
+        a no-answer error at the top). Response: route downstream to originator.
+        """
+        LOG.info(f"Received QUERY from: {client.peer}")
+        metadata = message.metadata or {}
+        if metadata.get("is_response", False):
+            self._route_query_response(message, client)
+            return
+
+        payload = self._unpack_message(message, client)
+        if not client.can_escalate:
+            LOG.warning("Received QUERY from client without escalate permission")
+            if self.illegal_callback:
+                self.illegal_callback(payload)
+            client.disconnect()
+            return
+
+        query_id = metadata.get("query_id", str(uuid.uuid4()))
+        originator_peer = metadata.get("originator_peer", client.peer)
+        bus = self.get_bus(client)
+        bus.emit(Message("hive.query.received",
+                         {"query_id": query_id, "originator_peer": originator_peer},
+                         {"source": client.peer}))
+
+        if self._answer_query_locally(message, client, query_id, originator_peer,
+                                      HiveMessageType.QUERY, message.route,
+                                      client.send):
+            return
+
+        if self._upstream_hm is not None:
+            self.query_to_master(payload, metadata)
+        else:
+            error_bus = Message("hive.query.timeout",
+                                {"query_id": query_id, "error": "no_answer"})
+            client.send(self._build_query_response(
+                HiveMessageType.QUERY, error_bus, query_id,
+                originator_peer, self.peer, route=message.route))
+
+    def cascade_from_master(self, message: HiveMessage) -> None:
+        """Fan a CASCADE received from the upstream master out to downstream clients."""
+        for peer, conn in self.clients.items():
+            conn.send(message)
+
+    def cascade_to_master(self, payload: HiveMessage, metadata: Optional[dict] = None) -> None:
+        """Forward a CASCADE upstream. No-op at the top-level master."""
+        if self._upstream_hm is None:
+            return
+        self._upstream_hm.emit(HiveMessage(HiveMessageType.CASCADE, payload=payload,
+                                           metadata=metadata))
+
+    def handle_cascade_message(self, message: HiveMessage,
+                               client: HiveMindClientConnection):
+        """CASCADE — like PROPAGATE but every node may answer. Request: try the
+        local agent, forward to all other peers + upstream, relay responses
+        (collected for disambiguation at the originator). Response: route
+        downstream toward the originator."""
+        LOG.info(f"Received CASCADE from: {client.peer}")
+        metadata = message.metadata or {}
+        if metadata.get("is_response", False):
+            self._route_query_response(message, client)
+            return
+
+        payload = self._unpack_message(message, client)
+        if not client.can_propagate:
+            LOG.warning("Received CASCADE from client without propagate permission")
+            if self.illegal_callback:
+                self.illegal_callback(payload)
+            client.disconnect()
+            return
+
+        query_id = metadata.get("query_id", str(uuid.uuid4()))
+        originator_peer = metadata.get("originator_peer", client.peer)
+        bus = self.get_bus(client)
+        bus.emit(Message("hive.cascade.received",
+                         {"query_id": query_id, "originator_peer": originator_peer},
+                         {"source": client.peer}))
+
+        self._answer_query_locally(
+            message, client, query_id, originator_peer, HiveMessageType.CASCADE,
+            message.route, lambda hm: self._route_query_response(hm, client))
+
+        cascade_fwd = HiveMessage(HiveMessageType.CASCADE, payload=payload,
+                                  metadata=metadata)
+        for peer in self.clients:
+            if peer == client.peer:
+                continue
+            self.clients[peer].send(cascade_fwd)
+        self.cascade_to_master(payload, metadata)
+
     def handle_escalate_message(
             self, message: HiveMessage, client: HiveMindClientConnection
     ):
@@ -948,7 +1517,8 @@ class HiveMindListenerProtocol:
             LOG.warning("Received escalate message from downstream, illegal action")
             if self.illegal_callback:
                 self.illegal_callback(payload)
-            # TODO kick client for misbehaviour so it stops doing that?
+            # kick client for misbehaviour so it stops doing that
+            client.disconnect()
             return
 
         if self.escalate_callback:
@@ -963,6 +1533,9 @@ class HiveMindListenerProtocol:
             site = message.target_site_id
             if site and site == self.identity.site_id:
                 self.handle_bus_message(message.payload, client)
+
+        # escalate up the chain to the master this node relays to (no-op at top level)
+        self.escalate_to_master(payload)
 
     def handle_intercom_message(
             self, message: HiveMessage, client: HiveMindClientConnection
@@ -980,72 +1553,99 @@ class HiveMindListenerProtocol:
                 ciphertext = pybase64.b64decode(pload["ciphertext"])
                 signature = pybase64.b64decode(pload["signature"])
 
-                # TODO - allow verifying, we need to store trusted pubkeys before this can be done
-                # pub = ""
-                # verified = verify_RSA(pub, ciphertext, signature)
+                # HIVEMIND-CRYPTO-1 §5 - verify the origin signature against
+                # the TOFU-pinned public key (pinned from the client's HELLO).
+                # A signature that fails against a known key means a forged
+                # origin — reject. If no pubkey was ever presented we cannot
+                # authenticate the origin; keep permissive behavior but say so.
+                pub = self.trusted_pubkeys.get(client.key) or client.pub_key
+                if pub:
+                    try:
+                        verified = verify_RSA(pub, ciphertext, signature)
+                    except Exception:
+                        verified = False
+                    if not verified:
+                        LOG.error(f"INTERCOM signature verification failed for "
+                                  f"{client.peer}: rejecting forged/mismatched message")
+                        return False
+                    # first verified sighting pins the key for this listener's lifetime
+                    self.trusted_pubkeys.setdefault(client.key, pub)
+                else:
+                    LOG.warning(f"INTERCOM from {client.peer} has no pinned/known "
+                                f"public key: origin authenticity is unverified")
 
                 private_key = load_RSA_key(self.identity.private_key)
 
                 decrypted: str = decrypt_RSA(private_key, ciphertext).decode("utf-8")
-                message._payload = HiveMessage.deserialize(decrypted)
+                inner = HiveMessage.deserialize(decrypted)
             except:
                 if k:
                     LOG.error("failed to decrypt message!")
                 else:
                     LOG.debug("failed to decrypt message, not for us")
                 return False
+        elif isinstance(pload, HiveMessage):
+            inner = pload
+        else:
+            # unencrypted intercom: the inner HiveMessage is carried as a
+            # plain dict. Deserialize it so it is dispatched on its OWN
+            # (inner) msg_type instead of the outer INTERCOM type, which
+            # matches no branch below and silently drops the message.
+            inner = HiveMessage.deserialize(pload)
 
-        if message.msg_type == HiveMessageType.BUS:
-            self.handle_bus_message(message, client)
+        if inner.msg_type == HiveMessageType.BUS:
+            self.handle_bus_message(inner, client)
             return True
-        elif message.msg_type == HiveMessageType.PROPAGATE:
-            self.handle_propagate_message(message, client)
+        elif inner.msg_type == HiveMessageType.PROPAGATE:
+            self.handle_propagate_message(inner, client)
             return True
-        elif message.msg_type == HiveMessageType.BROADCAST:
-            self.handle_broadcast_message(message, client)
+        elif inner.msg_type == HiveMessageType.BROADCAST:
+            self.handle_broadcast_message(inner, client)
             return True
-        elif message.msg_type == HiveMessageType.ESCALATE:
-            self.handle_escalate_message(message, client)
+        elif inner.msg_type == HiveMessageType.ESCALATE:
+            self.handle_escalate_message(inner, client)
             return True
-        elif message.msg_type == HiveMessageType.BINARY:
-            self.handle_binary_message(message, client)
+        elif inner.msg_type == HiveMessageType.BINARY:
+            self.handle_binary_message(inner, client)
             return True
-        elif message.msg_type == HiveMessageType.SHARED_BUS:
-            self.handle_client_shared_bus(message.payload, client)
+        elif inner.msg_type == HiveMessageType.SHARED_BUS:
+            self.handle_client_shared_bus(inner.payload, client)
             return True
 
         return False
 
     # HiveMind mycroft bus messages -  from slave -> master
-    def _update_blacklist(self, message: Message, client: HiveMindClientConnection, user=None):
-        LOG.debug("replacing message metadata with hivemind client session")
+    def _install_client_session(self, message: Message,
+                                 client: HiveMindClientConnection):
+        """Copy the client's serialised session onto an inbound bus message.
+
+        Must run BEFORE the policy chain so policies see the canonical
+        session (skill/intent injection mutations will land on this
+        dict).
+
+        Skill / intent / message-type blacklist injection moved to
+        ``OVOSAgentPolicy`` in ``hivemind-ovos-agent-plugin`` (see #85).
+        This method only handles the session-rewrite half of what used
+        to be ``_update_blacklist``: copy ``client.sess.serialize()`` onto
+        the message, taking care not to reattach a stale pipeline.
+
+        Per SESSION-1 §2: any session field carrying JSON ``null`` is
+        malformed and MUST be treated as absent (not preserved). This
+        method strips null-valued fields from the session before writing
+        it to the message context so downstream consumers never see them.
+        """
         raw_session = message.context.get("session") or {}
         session = client.sess.serialize()
-        if not isinstance(raw_session, dict) or "pipeline" not in raw_session:
-            # Each bus message owns its outbound pipeline; do not reattach one from an earlier message.
+        if not isinstance(raw_session, dict) or raw_session.get("pipeline") is None:
+            # Each bus message owns its outbound pipeline; do not reattach
+            # one from an earlier message. Per SESSION-1 §2 an explicit
+            # null pipeline is malformed and treated as absent; strip it
+            # here explicitly (serializers may render a None pipeline as
+            # [], which the generic null-strip below would not catch).
             session.pop("pipeline", None)
+        # SESSION-1 §2: strip null-valued fields — null is malformed, treat as absent.
+        session = {k: v for k, v in session.items() if v is not None}
         message.context["session"] = session
-
-        # update blacklist from db, to account for changes without requiring a restart
-        user = user or self._get_client_user(client)
-        if user is None:
-            return message
-        client.skill_blacklist = user.skill_blacklist or []
-        client.intent_blacklist = user.intent_blacklist or []
-        client.msg_blacklist = user.message_blacklist or []
-
-        # inject client specific blacklist into session
-        if "blacklisted_skills" not in message.context["session"]:
-            message.context["session"]["blacklisted_skills"] = []
-        if "blacklisted_intents" not in message.context["session"]:
-            message.context["session"]["blacklisted_intents"] = []
-
-        message.context["session"]["blacklisted_skills"] += [s for s in client.skill_blacklist
-                                                             if
-                                                             s not in message.context["session"]["blacklisted_skills"]]
-        message.context["session"]["blacklisted_intents"] += [s for s in client.intent_blacklist
-                                                              if s not in message.context["session"][
-                                                                  "blacklisted_intents"]]
         return message
 
     def handle_inject_agent_msg(
@@ -1063,14 +1663,19 @@ class HiveMindListenerProtocol:
             return
 
         # ensure client specific session data is injected in query to ovos
-        user = self._get_client_user(client)
-        message = self._update_blacklist(message, client, user=user)
-        if not self._authorize_bus_message_policies(message, client, user):
-            return
+        message = self._install_client_session(message, client)
         if message.msg_type == "speak":
             message.context["destination"] = ["audio"]  # make audible, this is injected "speak" command
         elif message.context.get("destination") is None:
             message.context["destination"] = "skills"  # ensure not treated as a broadcast
+
+        # policy admission chain — issue #85
+        verdict = self.policy_chain.review(message, client)
+        if verdict.denied:
+            LOG.info(f"policy denied '{message.msg_type}' from {client.peer}: "
+                     f"{verdict.code} ({verdict.reason})")
+            self._send_policy_denied(client, message, verdict)
+            return
 
         # send client message to internal mycroft bus
         LOG.info(f"Forwarding message '{message.msg_type}' to agent bus from client: {client.peer}")
@@ -1079,10 +1684,29 @@ class HiveMindListenerProtocol:
 
         bus = self.get_bus(client)
         bus.emit(message)
-        self._record_bus_message_policies(message, client, user)
+
+        self.policy_chain.observe(message, client)
 
         if self.agent_bus_callback:
             self.agent_bus_callback(message)
+
+    def _send_policy_denied(self, client: HiveMindClientConnection,
+                             message: Message, verdict) -> None:
+        """Inform a client that an admission policy denied their message."""
+        payload = Message(
+            "hive.policy.denied",
+            {
+                "denied_type": getattr(message, "msg_type", None),
+                "code": verdict.code,
+                "reason": verdict.reason,
+                "data": verdict.data,
+            },
+            {"source": "hivemind-core", "destination": client.peer},
+        )
+        try:
+            client.send(HiveMessage(HiveMessageType.BUS, payload=payload))
+        except Exception:
+            LOG.exception(f"failed to send hive.policy.denied to {client.peer}")
 
     def handle_client_shared_bus(self, message: Message, client: HiveMindClientConnection):
         # this message is going inside the client bus
