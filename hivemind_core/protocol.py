@@ -1561,7 +1561,14 @@ class HiveMindListenerProtocol:
             return False
         answered = False
         try:
-            for chunk in self.agent_protocol.answer_query(utterance, lang, client=client):
+            answer_message = getattr(
+                self.agent_protocol, "answer_query_message", None)
+            if callable(answer_message):
+                chunks = answer_message(admitted, client=client)
+            else:
+                chunks = self.agent_protocol.answer_query(
+                    utterance, lang, client=client)
+            for chunk in chunks:
                 if chunk is None:
                     break
                 answered = True
