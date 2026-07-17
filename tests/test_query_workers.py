@@ -50,6 +50,21 @@ class _BlockingAgent(_Agent):
         yield f"answer {utterance}"
 
 
+class _ContextAwareAgent(_Agent):
+    def __init__(self):
+        super().__init__(delay=0)
+        self.admitted = None
+        self.client = None
+
+    def answer_query_message(self, message, client=None):
+        self.admitted = message
+        self.client = client
+        yield "context-aware answer"
+
+    def answer_query(self, _utterance, _lang, client=None):
+        raise AssertionError("legacy answer_query path should not be called")
+
+
 class _BinaryProtocol:
     callbacks = ClientCallbacks()
     hm_protocol = None
@@ -138,6 +153,32 @@ def test_query_requests_run_concurrently(monkeypatch):
         assert len(agent.started) == 2
         start_times = [started_at for _, started_at in agent.started]
         assert max(start_times) - min(start_times) < agent.delay
+    finally:
+        proto.shutdown()
+
+
+def test_query_hands_admitted_message_to_context_aware_agent(monkeypatch):
+    agent = _ContextAwareAgent()
+    proto = _protocol(monkeypatch, agent=agent)
+    client = _Client()
+    client.sess.site_id = "customer-site"
+    client.sess.blacklisted_skills = ["blocked.skill"]
+
+    try:
+        proto.handle_query_message(_request("q-context", "hello"), client)
+
+        assert len(_wait_for_messages(client, 2)) == 2
+        assert agent.client is client
+        assert agent.admitted is not None
+        assert agent.admitted.context["destination"] == "skills"
+        assert agent.admitted.context["source"] == client.peer
+        assert agent.admitted.context["session"]["session_id"] == (
+            client.sess.session_id
+        )
+        assert agent.admitted.context["session"]["site_id"] == "customer-site"
+        assert agent.admitted.context["session"]["blacklisted_skills"] == [
+            "blocked.skill"
+        ]
     finally:
         proto.shutdown()
 
