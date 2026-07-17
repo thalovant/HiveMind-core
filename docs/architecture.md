@@ -59,7 +59,10 @@ messages). Responses from the agent travel back through the same path.
 ### QUERY / CASCADE streaming
 
 A `QUERY` message triggers `AgentProtocol.natural_language_query(utterance, lang)`, a
-generator that yields string answer chunks followed by a final `None` sentinel.
+generator that yields string answer chunks followed by a final `None` sentinel. Agents
+that implement the optional context-aware `answer_query_message(message, client)` seam
+may instead yield OVOS `Message` chunks. Core forwards their `skill_id` as safe reply
+provenance while replacing internal query/session correlation with the public query ID.
 Each chunk is forwarded to the satellite as it arrives. A `hive.query.complete` control
 message is sent when the generator exhausts. If the agent yields `None` immediately (no
 answer), the hub escalates the query upstream.
