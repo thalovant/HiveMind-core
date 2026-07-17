@@ -1572,8 +1572,27 @@ class HiveMindListenerProtocol:
                 if chunk is None:
                     break
                 answered = True
-                resp = Message("speak", {"utterance": chunk, "lang": lang},
-                               {"query_id": query_id})
+                if isinstance(chunk, Message):
+                    chunk_data = (dict(chunk.data)
+                                  if isinstance(chunk.data, dict) else {})
+                    chunk_data.setdefault("lang", lang)
+                    response_context = {
+                        "query_id": query_id,
+                        "session": {"session_id": query_id},
+                    }
+                    chunk_context = (chunk.context
+                                     if isinstance(chunk.context, dict) else {})
+                    skill_id = chunk_context.get("skill_id")
+                    if isinstance(skill_id, str) and skill_id:
+                        response_context["skill_id"] = skill_id
+                    resp = Message("speak", chunk_data, response_context)
+                else:
+                    resp = Message(
+                        "speak", {"utterance": chunk, "lang": lang},
+                        {
+                            "query_id": query_id,
+                            "session": {"session_id": query_id},
+                        })
                 send_fn(self._build_query_response(
                     msg_type, resp, query_id, originator_peer, self.peer,
                     route=route))

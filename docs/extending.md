@@ -123,6 +123,12 @@ def natural_language_query(self, utterance: str,
 This is the seam consumed by hivemind-core's QUERY and CASCADE message handlers.
 Yield `None` immediately if the agent has no answer (triggers upstream escalation).
 
+An agent that needs trusted request context or reply ownership can additionally
+implement `answer_query_message(message, client=None)`. It may yield OVOS `Message`
+chunks; core forwards a non-empty string `context["skill_id"]` while replacing private
+agent correlation fields with the public query ID. Other reply-context fields are not
+exposed to the client.
+
 **Registration:**
 
 ```toml

@@ -65,6 +65,24 @@ class _ContextAwareAgent(_Agent):
         raise AssertionError("legacy answer_query path should not be called")
 
 
+class _ProvenanceAgent(_ContextAwareAgent):
+    def answer_query_message(self, message, client=None):
+        self.admitted = message
+        self.client = client
+        yield Message(
+            "ovos.utterance.speak",
+            {"utterance": "owned answer"},
+            {
+                "query_id": "agent-internal-query",
+                "skill_id": "answer.skill",
+                "session": {
+                    "session_id": "agent-internal-query",
+                    "blacklisted_skills": ["must-not-leak"],
+                },
+            },
+        )
+
+
 class _BinaryProtocol:
     callbacks = ClientCallbacks()
     hm_protocol = None
@@ -179,6 +197,29 @@ def test_query_hands_admitted_message_to_context_aware_agent(monkeypatch):
         assert agent.admitted.context["session"]["blacklisted_skills"] == [
             "blocked.skill"
         ]
+    finally:
+        proto.shutdown()
+
+
+def test_query_response_preserves_only_safe_skill_provenance(monkeypatch):
+    agent = _ProvenanceAgent()
+    proto = _protocol(monkeypatch, agent=agent)
+    client = _Client()
+
+    try:
+        proto.handle_query_message(_request("q-provenance", "hello"), client)
+
+        sent = _wait_for_messages(client, 2)
+        assert len(sent) == 2
+        response = sent[0].payload.payload
+        assert response.msg_type == "speak"
+        assert response.data["utterance"] == "owned answer"
+        assert response.data["lang"] == "en-US"
+        assert response.context == {
+            "query_id": "q-provenance",
+            "session": {"session_id": "q-provenance"},
+            "skill_id": "answer.skill",
+        }
     finally:
         proto.shutdown()
 
