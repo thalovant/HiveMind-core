@@ -97,6 +97,7 @@ class _Client:
     site_id = "site"
     sent = None
     disconnected = False
+    handshake = SimpleNamespace(pubkey="client-public-key")
 
     def __init__(self, name="client"):
         self.name = name
@@ -171,6 +172,31 @@ def test_query_requests_run_concurrently(monkeypatch):
         assert len(agent.started) == 2
         start_times = [started_at for _, started_at in agent.started]
         assert max(start_times) - min(start_times) < agent.delay
+    finally:
+        proto.shutdown()
+
+
+def test_connection_hot_path_uses_startup_config_snapshot(monkeypatch):
+    proto = _protocol(monkeypatch, config={
+        "binarize": True,
+        "allowed_ciphers": ["AES-GCM"],
+        "allowed_encodings": ["json"],
+    })
+    client = _Client()
+    monkeypatch.setattr(
+        "hivemind_core.protocol.get_server_config",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("connection hot path re-read server config")
+        ),
+    )
+
+    try:
+        proto.handle_new_client(client)
+
+        assert len(client.sent) == 2
+        assert client.sent[0].msg_type == HiveMessageType.HELLO
+        assert client.sent[1].msg_type == HiveMessageType.HANDSHAKE
+        assert client.sent[1].payload["binarize"] is True
     finally:
         proto.shutdown()
 
