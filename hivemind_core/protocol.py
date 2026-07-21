@@ -428,6 +428,7 @@ class HiveMindListenerProtocol:
     _last_seen_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _last_seen_next_flush: dict = field(default_factory=dict, init=False, repr=False)
     _last_seen_queue_warning_after: float = field(default=0.0, init=False, repr=False)
+    _server_config: dict = field(default_factory=dict, init=False, repr=False)
     query_workers = 16
     query_queue_size = 256
     _query_executor: Optional[ThreadPoolExecutor] = field(default=None, init=False, repr=False)
@@ -446,6 +447,10 @@ class HiveMindListenerProtocol:
 
     def __post_init__(self):
         server_config = get_server_config()
+        # Server configuration is process-scoped and is not hot-reloaded.
+        # Snapshot it once so concurrent network-protocol admission workers do
+        # not contend on JsonStorage's filesystem lock for every connection.
+        self._server_config = dict(server_config)
         self.clients = {}
         # TOFU pinning store for INTERCOM origin authentication
         # (HIVEMIND-CRYPTO-1 §5). Maps a client's access key to the PEM
@@ -604,7 +609,7 @@ class HiveMindListenerProtocol:
         # minimum is the stricter of the configured floor and the crypto-derived
         # minimum.
         try:
-            cfg_min = ProtocolVersion(int(get_server_config().get("min_protocol_version", 2)))
+            cfg_min = ProtocolVersion(int(self._server_config.get("min_protocol_version", 2)))
         except (ValueError, KeyError):
             cfg_min = ProtocolVersion.TWO
         min_version = ProtocolVersion(max(int(cfg_min), int(crypto_min)))
@@ -615,7 +620,7 @@ class HiveMindListenerProtocol:
         v3_capable = NOISE_SUPPORTED and client.pswd_handshake is not None
         if v3_capable:
             max_version = ProtocolVersion.THREE
-        elif get_server_config().get("binarize", False):
+        elif self._server_config.get("binarize", False):
             max_version = ProtocolVersion.TWO
         else:
             max_version = ProtocolVersion.ONE
@@ -642,7 +647,7 @@ class HiveMindListenerProtocol:
 
         needs_handshake = not client.crypto_key and self.handshake_enabled
 
-        cfg = get_server_config()
+        cfg = self._server_config
         allowed_ciphers = cfg.get("allowed_ciphers") or [SupportedCiphers.AES_GCM]
         allowed_encodings = cfg.get("allowed_encodings") or list(SupportedEncodings)
 
@@ -675,9 +680,8 @@ class HiveMindListenerProtocol:
         # if client is in protocol V1 -> self.handle_handshake_message
         # clients can rotate their pubkey or session_key by sending a new handshake
 
-    @staticmethod
-    def _last_seen_queue_size() -> int:
-        raw = get_server_config().get("last_seen_queue_size", 1024)
+    def _last_seen_queue_size(self) -> int:
+        raw = self._server_config.get("last_seen_queue_size", 1024)
         try:
             return max(1, int(raw))
         except (TypeError, ValueError):
@@ -1162,7 +1166,7 @@ class HiveMindListenerProtocol:
             ciphers = [_norm_cipher(c) for c in ciphers]
 
             # allowed ciphers/encodings defined in config
-            cfg = get_server_config()
+            cfg = self._server_config
             allowed_encodings = cfg.get("allowed_encodings") or list(SupportedEncodings)
             allowed_ciphers = cfg.get("allowed_ciphers") or [SupportedCiphers.AES_GCM]
 
