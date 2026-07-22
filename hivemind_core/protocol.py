@@ -573,6 +573,18 @@ class HiveMindListenerProtocol:
         return self.agent_protocol.get_bus(client)
 
     def handle_new_client(self, client: HiveMindClientConnection):
+        """Initialize a client and publish its optional lifecycle events.
+
+        Transports that can accept inbound frames before lifecycle publication
+        completes may call :meth:`handle_new_client_protocol` first and defer
+        :meth:`handle_client_connected` to their own bounded worker.
+        """
+        if self.handle_new_client_protocol(client):
+            self.handle_client_connected(client)
+
+    def handle_new_client_protocol(
+            self, client: HiveMindClientConnection) -> bool:
+        """Queue protocol negotiation without running optional callbacks."""
         crypto_min = (
             ProtocolVersion.ONE
             if client.crypto_key is None and self.require_crypto
@@ -606,7 +618,7 @@ class HiveMindListenerProtocol:
                 f"{int(max_version)}"
             )
             client.disconnect()
-            return
+            return False
 
         hello_payload = {
             "pubkey": client.handshake.pubkey,
@@ -652,13 +664,15 @@ class HiveMindListenerProtocol:
         LOG.debug(f"starting {client.peer} HANDSHAKE: {payload}")
         client.send(msg)
 
-        # Queue protocol negotiation before optional lifecycle callbacks and
-        # runtime presence publication. Third-party callbacks and
-        # MessageBusClient.emit are synchronous and may serialize concurrent
-        # workers; neither is allowed to become a prerequisite for the client
-        # receiving HELLO/HANDSHAKE during an admission burst. The network
-        # protocol still awaits this method before accepting inbound client
-        # messages, preserving connect-before-message ordering.
+        return True
+
+    def handle_client_connected(self, client: HiveMindClientConnection):
+        """Publish optional lifecycle callbacks after protocol admission.
+
+        Callback and runtime-bus I/O are intentionally separate from protocol
+        initialization so a transport can return from its connection handler
+        before a slow third-party callback serializes a concurrent burst.
+        """
         try:
             self.callbacks.on_connect(client)
         except Exception:
