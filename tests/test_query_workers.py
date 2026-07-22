@@ -201,6 +201,35 @@ def test_connection_hot_path_uses_startup_config_snapshot(monkeypatch):
         proto.shutdown()
 
 
+def test_connection_queues_handshake_before_blocking_presence_emit(monkeypatch):
+    proto = _protocol(monkeypatch)
+    client = _Client()
+    presence_started = threading.Event()
+    release_presence = threading.Event()
+
+    def blocking_emit(_message):
+        presence_started.set()
+        release_presence.wait(1)
+
+    proto.agent_protocol.bus.emit = blocking_emit
+    worker = threading.Thread(target=proto.handle_new_client, args=(client,))
+    worker.start()
+
+    try:
+        assert presence_started.wait(1)
+        assert client.sent is not None
+        assert [message.msg_type for message in client.sent] == [
+            HiveMessageType.HELLO,
+            HiveMessageType.HANDSHAKE,
+        ]
+    finally:
+        release_presence.set()
+        worker.join(1)
+        proto.shutdown()
+
+    assert not worker.is_alive()
+
+
 def test_query_hands_admitted_message_to_context_aware_agent(monkeypatch):
     agent = _ContextAwareAgent()
     proto = _protocol(monkeypatch, agent=agent)

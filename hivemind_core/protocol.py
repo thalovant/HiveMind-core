@@ -588,17 +588,6 @@ class HiveMindListenerProtocol:
         except Exception:
             LOG.exception("error on connect agent callback")
 
-        LOG.debug(f"new client: {client.peer}")
-        message = Message(
-            "hive.client.connect",
-            {"key": client.key,
-             "session_id": client.sess.session_id},
-            {"source": client.peer},
-        )
-
-        bus = self.get_bus(client)
-        bus.emit(message)
-
         crypto_min = (
             ProtocolVersion.ONE
             if client.crypto_key is None and self.require_crypto
@@ -677,6 +666,29 @@ class HiveMindListenerProtocol:
         msg = HiveMessage(HiveMessageType.HANDSHAKE, payload)
         LOG.debug(f"starting {client.peer} HANDSHAKE: {payload}")
         client.send(msg)
+
+        # Queue the protocol negotiation frames before publishing presence to
+        # the runtime bus. MessageBusClient.emit performs a synchronous socket
+        # write and serializes concurrent senders, so making it a prerequisite
+        # for HELLO/HANDSHAKE turns a connection burst into a latency queue.
+        # The network protocol still awaits this method before accepting
+        # inbound client messages, preserving connect-before-message ordering.
+        LOG.debug(f"new client: {client.peer}")
+        message = Message(
+            "hive.client.connect",
+            {"key": client.key,
+             "session_id": client.sess.session_id},
+            {"source": client.peer},
+        )
+        bus = self.get_bus(client)
+        presence_started = time.monotonic()
+        bus.emit(message)
+        presence_ms = (time.monotonic() - presence_started) * 1000
+        if presence_ms >= 500:
+            LOG.info(
+                "Slow HiveMind client presence emit after handshake frames "
+                f"were queued: {presence_ms:.0f} ms"
+            )
         # if client is in protocol V1 -> self.handle_handshake_message
         # clients can rotate their pubkey or session_key by sending a new handshake
 
