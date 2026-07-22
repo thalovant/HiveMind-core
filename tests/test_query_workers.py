@@ -241,6 +241,73 @@ def test_connection_queues_handshake_before_blocking_presence_emit(monkeypatch):
     assert not worker.is_alive()
 
 
+def test_connection_queues_handshake_before_blocking_lifecycle_callback(monkeypatch):
+    proto = _protocol(monkeypatch)
+    client = _Client()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def blocking_callback(_client):
+        callback_started.set()
+        release_callback.wait(1)
+
+    proto.callbacks.on_connect = blocking_callback
+    worker = threading.Thread(target=proto.handle_new_client, args=(client,))
+    worker.start()
+
+    try:
+        assert callback_started.wait(1)
+        assert client.sent is not None
+        assert [message.msg_type for message in client.sent] == [
+            HiveMessageType.HELLO,
+            HiveMessageType.HANDSHAKE,
+        ]
+        assert proto.agent_protocol.bus.messages == []
+    finally:
+        release_callback.set()
+        worker.join(1)
+        proto.shutdown()
+
+    assert not worker.is_alive()
+
+
+def test_connection_protocol_admission_excludes_blocking_lifecycle_work(monkeypatch):
+    proto = _protocol(monkeypatch)
+    client = _Client()
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+    worker = None
+
+    def blocking_callback(_client):
+        callback_started.set()
+        release_callback.wait(1)
+
+    proto.callbacks.on_connect = blocking_callback
+
+    try:
+        assert proto.handle_new_client_protocol(client) is True
+        assert not callback_started.is_set()
+        assert [message.msg_type for message in client.sent] == [
+            HiveMessageType.HELLO,
+            HiveMessageType.HANDSHAKE,
+        ]
+
+        worker = threading.Thread(
+            target=proto.handle_client_connected,
+            args=(client,),
+        )
+        worker.start()
+        assert callback_started.wait(1)
+        assert proto.agent_protocol.bus.messages == []
+    finally:
+        release_callback.set()
+        if worker is not None:
+            worker.join(1)
+        proto.shutdown()
+
+    assert worker is not None and not worker.is_alive()
+
+
 def test_query_hands_admitted_message_to_context_aware_agent(monkeypatch):
     agent = _ContextAwareAgent()
     proto = _protocol(monkeypatch, agent=agent)
