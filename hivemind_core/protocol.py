@@ -573,21 +573,6 @@ class HiveMindListenerProtocol:
         return self.agent_protocol.get_bus(client)
 
     def handle_new_client(self, client: HiveMindClientConnection):
-        try:
-            self.callbacks.on_connect(client)
-        except Exception:
-            LOG.exception("error on connect callback")
-
-        try:  # let the binary protocol know about it
-            self.binary_data_protocol.callbacks.on_connect(client)
-        except Exception:
-            LOG.exception("error on connect binary callback")
-
-        try:  # let the agent protocol know about it
-            self.agent_protocol.callbacks.on_connect(client)
-        except Exception:
-            LOG.exception("error on connect agent callback")
-
         crypto_min = (
             ProtocolVersion.ONE
             if client.crypto_key is None and self.require_crypto
@@ -667,12 +652,28 @@ class HiveMindListenerProtocol:
         LOG.debug(f"starting {client.peer} HANDSHAKE: {payload}")
         client.send(msg)
 
-        # Queue the protocol negotiation frames before publishing presence to
-        # the runtime bus. MessageBusClient.emit performs a synchronous socket
-        # write and serializes concurrent senders, so making it a prerequisite
-        # for HELLO/HANDSHAKE turns a connection burst into a latency queue.
-        # The network protocol still awaits this method before accepting
-        # inbound client messages, preserving connect-before-message ordering.
+        # Queue protocol negotiation before optional lifecycle callbacks and
+        # runtime presence publication. Third-party callbacks and
+        # MessageBusClient.emit are synchronous and may serialize concurrent
+        # workers; neither is allowed to become a prerequisite for the client
+        # receiving HELLO/HANDSHAKE during an admission burst. The network
+        # protocol still awaits this method before accepting inbound client
+        # messages, preserving connect-before-message ordering.
+        try:
+            self.callbacks.on_connect(client)
+        except Exception:
+            LOG.exception("error on connect callback")
+
+        try:  # let the binary protocol know about it
+            self.binary_data_protocol.callbacks.on_connect(client)
+        except Exception:
+            LOG.exception("error on connect binary callback")
+
+        try:  # let the agent protocol know about it
+            self.agent_protocol.callbacks.on_connect(client)
+        except Exception:
+            LOG.exception("error on connect agent callback")
+
         LOG.debug(f"new client: {client.peer}")
         message = Message(
             "hive.client.connect",
