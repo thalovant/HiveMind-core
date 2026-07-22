@@ -50,6 +50,17 @@ class _BlockingAgent(_Agent):
         yield f"answer {utterance}"
 
 
+class _NoAnswerAgent(_Agent):
+    def answer_query(self, utterance, _lang, client=None):
+        yield None
+
+
+class _FailingAgent(_Agent):
+    def answer_query(self, utterance, _lang, client=None):
+        raise RuntimeError("runtime delivery failed")
+        yield
+
+
 class _ContextAwareAgent(_Agent):
     def __init__(self):
         super().__init__(delay=0)
@@ -305,13 +316,46 @@ def test_query_worker_pool_returns_busy_when_saturated(monkeypatch):
 
         proto.handle_query_message(_request("q2", "two"), client2)
 
-        sent = _wait_for_messages(client2, 1)
-        assert len(sent) == 1
+        sent = _wait_for_messages(client2, 2)
+        assert len(sent) == 2
         assert sent[0].payload.payload.data["error"] == "busy"
+        assert sent[1].payload.payload.msg_type == "hive.query.complete"
         agent.release_event.set()
         assert len(_wait_for_messages(client1, 2)) == 2
     finally:
         agent.release_event.set()
+        proto.shutdown()
+
+
+def test_query_no_answer_always_terminates_the_response_stream(monkeypatch):
+    proto = _protocol(monkeypatch, agent=_NoAnswerAgent())
+    client = _Client()
+
+    try:
+        proto.handle_query_message(_request("q-no-answer", "hello"), client)
+
+        sent = _wait_for_messages(client, 2)
+        assert len(sent) == 2
+        assert sent[0].payload.payload.msg_type == "hive.query.timeout"
+        assert sent[0].payload.payload.data["error"] == "no_answer"
+        assert sent[1].payload.payload.msg_type == "hive.query.complete"
+    finally:
+        proto.shutdown()
+
+
+def test_query_worker_error_always_terminates_the_response_stream(monkeypatch):
+    proto = _protocol(monkeypatch, agent=_FailingAgent())
+    client = _Client()
+
+    try:
+        proto.handle_query_message(_request("q-error", "hello"), client)
+
+        sent = _wait_for_messages(client, 2)
+        assert len(sent) == 2
+        assert sent[0].payload.payload.msg_type == "hive.query.timeout"
+        assert sent[0].payload.payload.data["error"] == "internal"
+        assert sent[1].payload.payload.msg_type == "hive.query.complete"
+    finally:
         proto.shutdown()
 
 
@@ -322,8 +366,9 @@ def test_shutdown_rejects_new_query_work(monkeypatch):
     proto.shutdown()
     proto.handle_query_message(_request("q-stop", "one"), client)
 
-    sent = _wait_for_messages(client, 1)
-    assert len(sent) == 1
+    sent = _wait_for_messages(client, 2)
+    assert len(sent) == 2
     assert sent[0].payload.payload.data["error"] == "busy"
+    assert sent[1].payload.payload.msg_type == "hive.query.complete"
     assert proto._query_executor is None
     assert not proto._query_workers_started

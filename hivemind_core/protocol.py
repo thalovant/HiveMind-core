@@ -1529,6 +1529,30 @@ class HiveMindListenerProtocol:
             msg.replace_route(route)
         return msg
 
+    def _send_query_failure(self, client: HiveMindClientConnection,
+                            query_id: str, originator_peer: str,
+                            error: str, route: Optional[list] = None) -> None:
+        """Send a query error and the mandatory terminal stream frame."""
+        client.send(self._build_query_response(
+            HiveMessageType.QUERY,
+            Message("hive.query.timeout", {
+                "query_id": query_id,
+                "error": error,
+            }),
+            query_id,
+            originator_peer,
+            self.peer,
+            route=route,
+        ))
+        client.send(self._build_query_response(
+            HiveMessageType.QUERY,
+            Message(QUERY_STREAM_END, {}),
+            query_id,
+            originator_peer,
+            self.peer,
+            route=route,
+        ))
+
     def _admit_for_query(self, message: Message,
                          client: HiveMindClientConnection) -> Optional[Message]:
         """Policy-admit a QUERY/CASCADE inner bus message without injecting it
@@ -1682,11 +1706,8 @@ class HiveMindListenerProtocol:
             LOG.warning("HiveMind query worker queue is full")
             query_id = metadata.get("query_id", str(uuid.uuid4()))
             originator_peer = metadata.get("originator_peer", client.peer)
-            error_bus = Message("hive.query.timeout",
-                                {"query_id": query_id, "error": "busy"})
-            client.send(self._build_query_response(
-                HiveMessageType.QUERY, error_bus, query_id,
-                originator_peer, self.peer, route=message.route))
+            self._send_query_failure(
+                client, query_id, originator_peer, "busy", message.route)
 
     def _handle_query_request(self, message: HiveMessage,
                               client: HiveMindClientConnection,
@@ -1707,19 +1728,22 @@ class HiveMindListenerProtocol:
                          {"query_id": query_id, "originator_peer": originator_peer},
                          {"source": client.peer}))
 
-        if self._answer_query_locally(message, client, query_id, originator_peer,
-                                      HiveMessageType.QUERY, message.route,
-                                      client.send):
+        try:
+            if self._answer_query_locally(
+                    message, client, query_id, originator_peer,
+                    HiveMessageType.QUERY, message.route, client.send):
+                return
+        except Exception:
+            LOG.exception("HiveMind local query failed for query_id=%s", query_id)
+            self._send_query_failure(
+                client, query_id, originator_peer, "internal", message.route)
             return
 
         if self._upstream_hm is not None:
             self.query_to_master(payload, metadata)
         else:
-            error_bus = Message("hive.query.timeout",
-                                {"query_id": query_id, "error": "no_answer"})
-            client.send(self._build_query_response(
-                HiveMessageType.QUERY, error_bus, query_id,
-                originator_peer, self.peer, route=message.route))
+            self._send_query_failure(
+                client, query_id, originator_peer, "no_answer", message.route)
 
     def cascade_from_master(self, message: HiveMessage) -> None:
         """Fan a CASCADE received from the upstream master out to downstream clients."""
