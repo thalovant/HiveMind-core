@@ -172,6 +172,8 @@ Near-term mitigations:
   websocket open;
 - let the transport seed the connection's resolved-user cache after successful
   authentication so immediate protocol metadata checks reuse the same row;
+- use the cache-guarded protocol initializer when the transport needs bounded
+  frame preparation on its event loop; stale or absent cache state fails closed;
 - benchmark with independent client identities when measuring user concurrency;
 - shard load across more logical hubs when interactive latency matters.
 

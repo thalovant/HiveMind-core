@@ -592,6 +592,23 @@ class HiveMindListenerProtocol:
         if self.handle_new_client_protocol(client):
             self.handle_client_connected(client)
 
+    def handle_new_client_protocol_cached(
+            self, client: HiveMindClientConnection) -> bool:
+        """Initialize protocol frames from a transport-seeded client row.
+
+        This entry point is the bounded, event-loop-safe variant used by
+        transports that have just authenticated a client and seeded
+        ``client.cache_resolved_user``. Refuse stale or missing cache state so
+        callers cannot accidentally move remote database I/O onto their event
+        loop.
+        """
+        if (client._resolved_user is None
+                or time.time() - client._resolved_user_ts > 5.0):
+            raise RuntimeError(
+                "cached protocol admission requires a current resolved user"
+            )
+        return self.handle_new_client_protocol(client)
+
     def handle_new_client_protocol(
             self, client: HiveMindClientConnection) -> bool:
         """Queue protocol negotiation without running optional callbacks."""
