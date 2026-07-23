@@ -170,6 +170,8 @@ Near-term mitigations:
 - keep per-message and per-disconnect logs at debug level on hot paths;
 - use direct database lookup for API-key admission instead of full database sync on every
   websocket open;
+- let the transport seed the connection's resolved-user cache after successful
+  authentication so immediate protocol metadata checks reuse the same row;
 - benchmark with independent client identities when measuring user concurrency;
 - shard load across more logical hubs when interactive latency matters.
 

@@ -202,6 +202,16 @@ class HiveMindClientConnection:
         self._resolved_user_ts = time.time()
         return self._resolved_user
 
+    def cache_resolved_user(self, user: Client) -> None:
+        """Seed this connection with a row already resolved by its transport.
+
+        Network transports authenticate the access key before the core starts
+        protocol negotiation. Reusing that exact row keeps protocol metadata
+        checks from issuing a redundant database lookup during admission.
+        """
+        self._resolved_user = user
+        self._resolved_user_ts = time.time()
+
     def invalidate_user(self) -> None:
         """Drop the cached resolved user so the next ``resolve_user`` call
         forces a fresh DB lookup."""
@@ -1042,7 +1052,7 @@ class HiveMindListenerProtocol:
         """
         try:
             with self.db:
-                user = self.db.get_client_by_api_key(client.key)
+                user = client.resolve_user(self.db)
             if user is not None:
                 return (user.metadata or {}).get("noise_pubkey")
         except Exception:
