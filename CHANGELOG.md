@@ -1,5 +1,11 @@
 # Changelog
 
+## [4.10.2a8](https://github.com/thalovant/HiveMind-core/tree/4.10.2a8) (2026-07-23)
+
+- Expose a fail-closed, bounded protocol-admission entry point for transports
+  that have just seeded a current authenticated client row, keeping remote
+  database work off network event loops.
+
 ## [4.10.2a2](https://github.com/JarbasHiveMind/HiveMind-core/tree/4.10.2a2) (2026-07-16)
 
 [Full Changelog](https://github.com/JarbasHiveMind/HiveMind-core/compare/4.10.2a1...4.10.2a2)
