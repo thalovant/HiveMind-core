@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from threading import Lock
 
@@ -38,7 +39,7 @@ class LatencyHistogram:
             should_log = bool(
                 self._log_every and self._count % self._log_every == 0
             )
-        if should_log:
+        if should_log and LOG.isEnabledFor(logging.INFO):
             snapshot = self.snapshot()
             LOG.info(
                 "latency_histogram name=%s count=%d sum_ms=%.3f buckets=%s",
