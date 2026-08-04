@@ -57,6 +57,17 @@ def test_fanout_serializes_once_and_reuses_plaintext():
         assert isinstance(args[1], str)
 
 
+def test_binary_fanout_defers_wire_encoding_to_each_connection():
+    clients = [_connection(f"peer-{index}") for index in range(3)]
+    protocol = _protocol(*clients)
+    message = HiveMessage(HiveMessageType.BINARY, payload=b"binary payload")
+
+    protocol._fanout(message)
+
+    for client in clients:
+        client.send.assert_called_once_with(message, None)
+
+
 def test_fanout_uses_a_stable_client_snapshot():
     first = _connection("first")
     last = _connection("last")

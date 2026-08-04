@@ -1430,7 +1430,8 @@ class HiveMindListenerProtocol:
     def _fanout(self, message: HiveMessage,
                 excluded_peer: Optional[str] = None) -> None:
         """Send one message to a stable client snapshot at per-peer isolation."""
-        plaintext = message.serialize()
+        plaintext = (None if message.msg_type == HiveMessageType.BINARY
+                     else message.serialize())
         for connection in list(self.clients.values()):
             if connection.peer == excluded_peer:
                 continue
