@@ -242,6 +242,7 @@ class HiveMindClientConnection:
         """Encrypt and queue one message, optionally reusing serialized text."""
         with self._send_lock:
             is_bin = message.msg_type == HiveMessageType.BINARY
+            track_delivery = self._is_reply_delivery(message)
             if not is_bin and message.msg_type == HiveMessageType.BUS:
                 payload_type = (message.payload.get("type")
                                 if isinstance(message.payload, dict)
@@ -262,7 +263,7 @@ class HiveMindClientConnection:
                     payload = (plaintext if plaintext is not None
                                else message.serialize())
                 encrypted = self.noise_transport.encrypt_frame(payload)
-                return self.send_msg(encrypted, True)
+                return self._send_transport(encrypted, True, track_delivery)
 
             if self.crypto_key and message.msg_type not in [
                 HiveMessageType.HANDSHAKE,
@@ -300,7 +301,56 @@ class HiveMindClientConnection:
                            else message.serialize())
                 _log.debug("sent unencrypted")
 
-            return self.send_msg(payload, is_bin)
+            return self._send_transport(payload, is_bin, track_delivery)
+
+    @staticmethod
+    def _is_reply_delivery(message: HiveMessage) -> bool:
+        """Return whether a frame completes a public request/reply exchange.
+
+        Handshake, ping, and unrelated downstream traffic would make the
+        request-delivery histogram impossible to interpret. Query envelopes
+        and the public OVOS reply events consumed by SDK clients are the
+        stable protocol boundary measured here.
+        """
+        if message.msg_type in (HiveMessageType.QUERY, HiveMessageType.CASCADE):
+            return True
+        if message.msg_type != HiveMessageType.BUS:
+            return False
+        if isinstance(message.payload, dict):
+            payload_type = message.payload.get("type")
+        else:
+            payload_type = getattr(message.payload, "msg_type", None)
+        return payload_type in {
+            "speak",
+            "ovos.utterance.speak",
+            "ovos.utterance.handled",
+        }
+
+    def _send_transport(self, payload, is_binary: bool,
+                        track_delivery: bool):
+        """Write one frame and observe completion without changing its Future.
+
+        Tornado and concurrent futures both expose ``add_done_callback``. The
+        callback keeps the metric aligned with transport completion while the
+        original future remains available to callers that require confirmed
+        delivery semantics.
+        """
+        started = time.monotonic()
+        delivery = self.send_msg(payload, is_binary)
+        if not track_delivery:
+            return delivery
+
+        def _observe(_future=None):
+            REPLY_DELIVERY.observe_ms(
+                (time.monotonic() - started) * 1000
+            )
+
+        add_done_callback = getattr(delivery, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(_observe)
+        else:
+            _observe()
+        return delivery
 
     @property
     def crypto_required(self) -> bool:
@@ -1720,7 +1770,6 @@ class HiveMindListenerProtocol:
                     msg_type, resp, query_id, originator_peer, self.peer,
                     route=route,
                 )
-                delivery_started = time.monotonic()
                 delivery = send_fn(response)
                 if isinstance(delivery, Future):
                     raw_timeout = self._server_config.get(
@@ -1731,9 +1780,6 @@ class HiveMindListenerProtocol:
                     except (TypeError, ValueError):
                         delivery_timeout = 5.0
                     delivery.result(timeout=delivery_timeout)
-                REPLY_DELIVERY.observe_ms(
-                    (time.monotonic() - delivery_started) * 1000
-                )
         except NotImplementedError:
             return False  # agent has no NL backend -> escalate
         if answered:
