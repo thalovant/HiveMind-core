@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from threading import Lock
-from typing import Dict, Iterable
 
 from ovos_utils.log import LOG
-
 
 DEFAULT_BUCKETS_MS = (
     1.0, 2.5, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0,
@@ -49,7 +48,7 @@ class LatencyHistogram:
                 snapshot["buckets"],
             )
 
-    def snapshot(self) -> Dict[str, object]:
+    def snapshot(self) -> dict[str, object]:
         """Return an immutable, JSON-friendly cumulative snapshot."""
         with self._lock:
             buckets = {
@@ -68,6 +67,6 @@ class LatencyHistogram:
 REPLY_DELIVERY = LatencyHistogram("hivemind_reply_delivery_ms")
 
 
-def performance_histograms() -> Dict[str, Dict[str, object]]:
+def performance_histograms() -> dict[str, dict[str, object]]:
     """Return all Core performance histograms."""
     return {REPLY_DELIVERY.name: REPLY_DELIVERY.snapshot()}
