@@ -9,7 +9,7 @@ import queue
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Union, List, Optional, Callable, Literal
@@ -21,6 +21,7 @@ from ovos_bus_client.session import Session
 from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
 from hivemind_core.config import get_server_config
+from hivemind_core._metrics import REPLY_DELIVERY
 from hivemind_bus_client.identity import NodeIdentity
 from hivemind_bus_client.message import HiveMessage, HiveMessageType, HiveMindBinaryPayloadType
 from hivemind_bus_client.serialization import decode_bitstring, get_bitstring
@@ -261,8 +262,7 @@ class HiveMindClientConnection:
                     payload = (plaintext if plaintext is not None
                                else message.serialize())
                 encrypted = self.noise_transport.encrypt_frame(payload)
-                self.send_msg(encrypted, True)
-                return
+                return self.send_msg(encrypted, True)
 
             if self.crypto_key and message.msg_type not in [
                 HiveMessageType.HANDSHAKE,
@@ -300,7 +300,7 @@ class HiveMindClientConnection:
                            else message.serialize())
                 _log.debug("sent unencrypted")
 
-            self.send_msg(payload, is_bin)
+            return self.send_msg(payload, is_bin)
 
     @property
     def crypto_required(self) -> bool:
@@ -1716,9 +1716,24 @@ class HiveMindListenerProtocol:
                             "query_id": query_id,
                             "session": {"session_id": query_id},
                         })
-                send_fn(self._build_query_response(
+                response = self._build_query_response(
                     msg_type, resp, query_id, originator_peer, self.peer,
-                    route=route))
+                    route=route,
+                )
+                delivery_started = time.monotonic()
+                delivery = send_fn(response)
+                if isinstance(delivery, Future):
+                    raw_timeout = self._server_config.get(
+                        "reply_delivery_timeout", 5.0
+                    )
+                    try:
+                        delivery_timeout = max(0.1, float(raw_timeout))
+                    except (TypeError, ValueError):
+                        delivery_timeout = 5.0
+                    delivery.result(timeout=delivery_timeout)
+                REPLY_DELIVERY.observe_ms(
+                    (time.monotonic() - delivery_started) * 1000
+                )
         except NotImplementedError:
             return False  # agent has no NL backend -> escalate
         if answered:

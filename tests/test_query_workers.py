@@ -1,10 +1,12 @@
 import threading
 import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
 from hivemind_core.policy import PolicyChain
 from hivemind_core.protocol import HiveMindListenerProtocol
+from hivemind_core._metrics import REPLY_DELIVERY
 from hivemind_plugin_manager.protocols import ClientCallbacks
 from ovos_bus_client.message import Message
 from ovos_bus_client.session import Session
@@ -128,6 +130,21 @@ class _Client:
 
     def authorize(self, _message):
         return True
+
+
+class _ConfirmedClient(_Client):
+    def __init__(self, name="client"):
+        super().__init__(name=name)
+        self.delivery_started = threading.Event()
+        self.delivery = Future()
+
+    def send(self, message):
+        super().send(message)
+        inner = getattr(getattr(message, "payload", None), "payload", None)
+        if getattr(inner, "msg_type", None) == "speak":
+            self.delivery_started.set()
+            return self.delivery
+        return None
 
 
 def _protocol(monkeypatch, agent=None, config=None):
@@ -354,6 +371,26 @@ def test_query_response_preserves_only_safe_skill_provenance(monkeypatch):
             "skill_id": "answer.skill",
         }
     finally:
+        proto.shutdown()
+
+
+def test_query_stream_waits_for_confirmed_reply_delivery(monkeypatch):
+    proto = _protocol(monkeypatch, agent=_ContextAwareAgent())
+    client = _ConfirmedClient()
+    initial_observations = REPLY_DELIVERY.snapshot()["count"]
+
+    try:
+        proto.handle_query_message(_request("q-delivery", "hello"), client)
+
+        assert client.delivery_started.wait(1)
+        assert len(client.sent) == 1
+        client.delivery.set_result(None)
+
+        assert len(_wait_for_messages(client, 2)) == 2
+        assert REPLY_DELIVERY.snapshot()["count"] == initial_observations + 1
+    finally:
+        if not client.delivery.done():
+            client.delivery.set_result(None)
         proto.shutdown()
 
 

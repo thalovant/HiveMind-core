@@ -2,6 +2,7 @@ import queue
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from hivemind_core.config import _DEFAULT
 from hivemind_core.protocol import HiveMindListenerProtocol
 
 
@@ -59,6 +60,11 @@ def _client(peer="peer", key="access-key"):
         peer=peer,
         sess=SimpleNamespace(serialize=MagicMock(return_value={})),
     )
+
+
+def test_performance_defaults_are_bounded():
+    assert _DEFAULT["last_seen_update_interval"] == 60
+    assert _DEFAULT["reply_delivery_timeout"] == 5
 
 
 def test_last_seen_touches_are_queued_and_coalesced_per_client_key():
