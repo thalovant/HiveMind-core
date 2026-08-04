@@ -28,7 +28,8 @@ def _relay_chain():
     b = TopologyBuilder()
     m = b.add_master("M0")
     m.register_satellite("relay-key", password="relay-password")
-    _sat_side, master_side = b.add_relay("R0", upstream=m)
+    relay = b.add_relay("R0", upstream=m)
+    master_side = relay.listener if hasattr(relay, "listener") else relay[1]
     master_side.register_satellite("sat-key", password="sat-password")
     b.add_satellite("S0", upstream=master_side)
     return b

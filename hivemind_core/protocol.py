@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
 import json
+import logging
 import os
 import queue
 import threading
@@ -66,9 +67,14 @@ from hivemind_bus_client.hive_map import HiveMapper
 from hivemind_plugin_manager.protocols import AgentProtocol, BinaryDataHandlerProtocol, ClientCallbacks
 from hivemind_plugin_manager.database import Client
 from hivemind_plugin_manager.policy import PolicyPlugin
-from hivemind_core.policy import PolicyChain
+from hivemind_core.policy import BACKEND_UNAVAILABLE, PolicyChain
 from poorman_handshake import HandShake, PasswordHandShake
 from poorman_handshake.asymmetric.utils import decrypt_RSA, load_RSA_key, verify_RSA
+
+
+# Per-peer send is a high-volume path. OVOS LOG.debug inspects the stack even
+# when DEBUG is disabled; stdlib logging returns before doing that work.
+_log = logging.getLogger(__name__)
 
 
 class ProtocolVersion(IntEnum):
@@ -179,6 +185,10 @@ class HiveMindClientConnection:
     # on the admission hot path. Not part of the public field set.
     _resolved_user: Optional[Client] = field(default=None, init=False, repr=False)
     _resolved_user_ts: float = field(default=0.0, init=False, repr=False)
+    # Noise assigns sequential nonces. Encrypting and queueing a frame must be
+    # atomic across the IOLoop, OVOS bus, and relay threads using this client.
+    _send_lock: threading.RLock = field(default_factory=threading.RLock,
+                                        init=False, repr=False)
 
     def resolve_user(self, db, ttl: float = 5.0,
                      force: bool = False) -> Optional[Client]:
@@ -227,54 +237,70 @@ class HiveMindClientConnection:
         # this is how ovos refers to connected nodes in message.context
         return f"{self.name}::{self.sess.session_id}"
 
-    def send(self, message: HiveMessage):
-        is_bin = message.msg_type == HiveMessageType.BINARY
-        if not is_bin and message.msg_type == HiveMessageType.BUS:
-            _payload_type = (message.payload.get("type")
-                             if isinstance(message.payload, dict)
-                             else message.payload.msg_type)
-            LOG.debug(f"mycroft_type {_payload_type}")
+    def send(self, message: HiveMessage, plaintext: Optional[str] = None):
+        """Encrypt and queue one message, optionally reusing serialized text."""
+        with self._send_lock:
+            is_bin = message.msg_type == HiveMessageType.BINARY
+            if not is_bin and message.msg_type == HiveMessageType.BUS:
+                payload_type = (message.payload.get("type")
+                                if isinstance(message.payload, dict)
+                                else message.payload.msg_type)
+                _log.debug("mycroft_type %s", payload_type)
 
-        LOG.debug(f"sending to {self.peer}: {message.msg_type}")
+            _log.debug("sending to %s: %s", self.peer, message.msg_type)
 
-        if self.noise_transport is not None:
-            # protocol v3: every message (HELLO/HANDSHAKE included) is a Noise
-            # transport message — there is no cleartext v3 session (§3.4.5)
-            if self.binarize or is_bin:
-                payload = get_bitstring(hive_type=message.msg_type,
-                                        payload=message.payload,
-                                        hivemeta=message.metadata,
-                                        binary_type=message.bin_type).bytes
+            if self.noise_transport is not None:
+                if self.binarize or is_bin:
+                    payload = get_bitstring(
+                        hive_type=message.msg_type,
+                        payload=message.payload,
+                        hivemeta=message.metadata,
+                        binary_type=message.bin_type,
+                    ).bytes
+                else:
+                    payload = (plaintext if plaintext is not None
+                               else message.serialize())
+                encrypted = self.noise_transport.encrypt_frame(payload)
+                self.send_msg(encrypted, True)
+                return
+
+            if self.crypto_key and message.msg_type not in [
+                HiveMessageType.HANDSHAKE,
+                HiveMessageType.HELLO,
+            ]:
+                if self.binarize or is_bin:
+                    payload = get_bitstring(
+                        hive_type=message.msg_type,
+                        payload=message.payload,
+                        hivemeta=message.metadata,
+                        binary_type=message.bin_type,
+                    ).bytes
+                    _log.debug("unencrypted binary payload size: %d bytes",
+                               len(payload))
+                    payload = encrypt_bin(
+                        key=self.crypto_key,
+                        plaintext=payload,
+                        cipher=self.cipher,
+                    )
+                    is_bin = True
+                else:
+                    plaintext = (plaintext if plaintext is not None
+                                 else message.serialize())
+                    _log.debug("unencrypted payload size: %d bytes",
+                               len(plaintext))
+                    payload = encrypt_as_json(
+                        key=self.crypto_key,
+                        plaintext=plaintext,
+                        cipher=self.cipher,
+                        encoding=self.encoding,
+                    )
+                _log.debug("encrypted payload size: %d bytes", len(payload))
             else:
-                payload = message.serialize()
-            self.send_msg(self.noise_transport.encrypt_frame(payload), True)
-            return
+                payload = (plaintext if plaintext is not None
+                           else message.serialize())
+                _log.debug("sent unencrypted")
 
-        if self.crypto_key and message.msg_type not in [
-            HiveMessageType.HANDSHAKE,
-            HiveMessageType.HELLO,
-        ]:
-            if self.binarize or is_bin:
-                payload = get_bitstring(hive_type=message.msg_type,
-                                        payload=message.payload,
-                                        hivemeta=message.metadata,
-                                        binary_type=message.bin_type).bytes
-                LOG.debug(f"unencrypted binary payload size: {len(payload)} bytes")
-                payload = encrypt_bin(key=self.crypto_key, plaintext=payload, cipher=self.cipher)
-                is_bin = True
-            else:
-                plaintext = message.serialize()
-                LOG.debug(f"unencrypted payload size: {len(plaintext)} bytes")
-                payload = encrypt_as_json(
-                    key=self.crypto_key, plaintext=plaintext,
-                    cipher=self.cipher, encoding=self.encoding
-                )  # json string
-            LOG.debug(f"encrypted payload size: {len(payload)} bytes")
-        else:
-            payload = message.serialize()
-            LOG.debug("sent unencrypted!")
-
-        self.send_msg(payload, is_bin)
+            self.send_msg(payload, is_bin)
 
     @property
     def crypto_required(self) -> bool:
@@ -582,6 +608,25 @@ class HiveMindListenerProtocol:
         # routing on the inject path stays transparent here.
         return self.agent_protocol.get_bus(client)
 
+    def _emit_lifecycle(self, client: HiveMindClientConnection,
+                        message: Message) -> None:
+        """Publish best-effort lifecycle telemetry without rejecting a peer."""
+        started = time.monotonic()
+        try:
+            self.get_bus(client).emit(message)
+        except (ConnectionError, TimeoutError) as error:
+            LOG.error(
+                f"Can not emit '{message.msg_type}' for {client.peer}; "
+                f"the agent bus is unavailable: {error}"
+            )
+            return
+        elapsed_ms = (time.monotonic() - started) * 1000
+        if elapsed_ms >= 500:
+            LOG.info(
+                f"Slow HiveMind lifecycle emit '{message.msg_type}': "
+                f"{elapsed_ms:.0f} ms"
+            )
+
     def handle_new_client(self, client: HiveMindClientConnection):
         """Initialize a client and publish its optional lifecycle events.
 
@@ -722,15 +767,7 @@ class HiveMindListenerProtocol:
              "session_id": client.sess.session_id},
             {"source": client.peer},
         )
-        bus = self.get_bus(client)
-        presence_started = time.monotonic()
-        bus.emit(message)
-        presence_ms = (time.monotonic() - presence_started) * 1000
-        if presence_ms >= 500:
-            LOG.info(
-                "Slow HiveMind client presence emit after handshake frames "
-                f"were queued: {presence_ms:.0f} ms"
-            )
+        self._emit_lifecycle(client, message)
         # if client is in protocol V1 -> self.handle_handshake_message
         # clients can rotate their pubkey or session_key by sending a new handshake
 
@@ -881,7 +918,8 @@ class HiveMindListenerProtocol:
 
         if client.peer in self.clients:
             self.clients.pop(client.peer)
-        if not any(conn.key == client.key for conn in self.clients.values()):
+        if not any(conn.key == client.key
+                   for conn in list(self.clients.values())):
             with self._last_seen_lock:
                 self._last_seen_next_flush.pop(client.key, None)
         client.disconnect()
@@ -890,8 +928,7 @@ class HiveMindListenerProtocol:
             {"key": client.key},
             {"source": client.peer, "session": client.sess.serialize()},
         )
-        bus = self.get_bus(client)
-        bus.emit(message)
+        self._emit_lifecycle(client, message)
 
     def handle_invalid_key_connected(self, client: HiveMindClientConnection):
         try:
@@ -915,8 +952,7 @@ class HiveMindListenerProtocol:
             {"error": "invalid access key", "peer": client.peer},
             {"source": client.peer},
         )
-        bus = self.get_bus(client)
-        bus.emit(message)
+        self._emit_lifecycle(client, message)
 
     def handle_invalid_protocol_version(self, client: HiveMindClientConnection):
         try:
@@ -940,8 +976,7 @@ class HiveMindListenerProtocol:
             {"error": "protocol error", "peer": client.peer},
             {"source": client.peer},
         )
-        bus = self.get_bus(client)
-        bus.emit(message)
+        self._emit_lifecycle(client, message)
 
     def handle_message(self, message: HiveMessage, client: HiveMindClientConnection):
         """
@@ -1381,10 +1416,7 @@ class HiveMindListenerProtocol:
 
         # broadcast message to other peers
         payload = self._unpack_message(message, client)
-        for peer in self.clients:
-            if peer == client.peer:
-                continue
-            self.clients[peer].send(payload)
+        self._fanout(payload, excluded_peer=client.peer)
 
     def _unpack_message(self, message: HiveMessage, client: HiveMindClientConnection):
         # propagate message to other peers
@@ -1394,6 +1426,21 @@ class HiveMindListenerProtocol:
         pload.update_source_peer(self.peer)
         pload.remove_target_peer(client.peer)
         return pload
+
+    def _fanout(self, message: HiveMessage,
+                excluded_peer: Optional[str] = None) -> None:
+        """Send one message to a stable client snapshot at per-peer isolation."""
+        plaintext = message.serialize()
+        for connection in list(self.clients.values()):
+            if connection.peer == excluded_peer:
+                continue
+            try:
+                connection.send(message, plaintext)
+            except Exception:
+                LOG.exception(
+                    f"Failed to fan out {message.msg_type} to "
+                    f"{connection.peer}"
+                )
 
     def handle_propagate_message(
             self, message: HiveMessage, client: HiveMindClientConnection
@@ -1432,10 +1479,7 @@ class HiveMindListenerProtocol:
             self.handle_ping_message(payload, client)
 
         # propagate message to other peers
-        for peer in self.clients:
-            if peer == client.peer:
-                continue
-            self.clients[peer].send(payload)
+        self._fanout(payload, excluded_peer=client.peer)
 
         # forward upstream to the master this node relays to (no-op at top level)
         self.propagate_to_master(payload)
@@ -1468,7 +1512,7 @@ class HiveMindListenerProtocol:
         # Surface every observed PING on the agent bus (discovery/telemetry).
         # Fires for satellite-originated and flood-cycle pings alike, before the
         # dedup gate below.
-        self.agent_protocol.bus.emit(Message("hive.ping.received", {
+        self._emit_lifecycle(client, Message("hive.ping.received", {
             "flood_id": flood_id,
             "peer": ping_payload.get("peer"),
             "site_id": ping_payload.get("site_id"),
@@ -1497,8 +1541,7 @@ class HiveMindListenerProtocol:
         LOG.debug(f"Sending responsive PING for flood_id={flood_id}")
 
         # Send to all downstream peers
-        for peer_id, conn in self.clients.items():
-            conn.send(own_ping_outer)
+        self._fanout(own_ping_outer)
 
     def bind_upstream(self, slave) -> None:
         """Bind a ``HiveMindSlaveProtocol`` as this node's upstream connection,
@@ -1515,14 +1558,12 @@ class HiveMindListenerProtocol:
     def broadcast_from_master(self, message: HiveMessage) -> None:
         """Fan a BROADCAST received from the upstream master out to all
         downstream clients."""
-        for peer, conn in self.clients.items():
-            conn.send(message)
+        self._fanout(message)
 
     def propagate_from_master(self, message: HiveMessage) -> None:
         """Fan a PROPAGATE received from the upstream master out to all
         downstream clients."""
-        for peer, conn in self.clients.items():
-            conn.send(message)
+        self._fanout(message)
 
     def escalate_to_master(self, payload: HiveMessage) -> None:
         """Forward an ESCALATE upstream. No-op when this node is the top-level
@@ -1540,8 +1581,7 @@ class HiveMindListenerProtocol:
 
     def query_from_master(self, message: HiveMessage) -> None:
         """Fan a QUERY received from the upstream master out to downstream clients."""
-        for peer, conn in self.clients.items():
-            conn.send(message)
+        self._fanout(message)
 
     def query_to_master(self, payload: HiveMessage, metadata: Optional[dict] = None) -> None:
         """Forward a QUERY upstream. No-op at the top-level master."""
@@ -1705,7 +1745,14 @@ class HiveMindListenerProtocol:
                     query_id=query_id, originator_peer=originator_peer)
             collector = self._pending_cascades[query_id]
             collector.add_response(message)
-            bus = self.get_bus(self.clients[originator_peer])
+            try:
+                bus = self.get_bus(self.clients[originator_peer])
+            except (ConnectionError, TimeoutError) as error:
+                LOG.error(
+                    f"Can not run cascade selection for query_id={query_id}; "
+                    f"the agent bus is unavailable: {error}"
+                )
+                return
             try:
                 selected = self.cascade_select_callback(query_id, collector.responses)
                 if selected is not None:
@@ -1726,10 +1773,7 @@ class HiveMindListenerProtocol:
                 self.clients[src].send(message)
                 return
         # unknown return path: fan downstream (excluding the sender) as a last resort
-        for peer in self.clients:
-            if peer == client.peer:
-                continue
-            self.clients[peer].send(message)
+        self._fanout(message, excluded_peer=client.peer)
 
     def handle_query_message(self, message: HiveMessage,
                              client: HiveMindClientConnection):
@@ -1765,10 +1809,16 @@ class HiveMindListenerProtocol:
 
         query_id = metadata.get("query_id", str(uuid.uuid4()))
         originator_peer = metadata.get("originator_peer", client.peer)
-        bus = self.get_bus(client)
-        bus.emit(Message("hive.query.received",
-                         {"query_id": query_id, "originator_peer": originator_peer},
-                         {"source": client.peer}))
+        try:
+            bus = self.get_bus(client)
+            bus.emit(Message(
+                "hive.query.received",
+                {"query_id": query_id, "originator_peer": originator_peer},
+                {"source": client.peer},
+            ))
+        except (ConnectionError, TimeoutError) as error:
+            self._send_backend_unavailable(client, message, error)
+            return
 
         try:
             if self._answer_query_locally(
@@ -1789,8 +1839,7 @@ class HiveMindListenerProtocol:
 
     def cascade_from_master(self, message: HiveMessage) -> None:
         """Fan a CASCADE received from the upstream master out to downstream clients."""
-        for peer, conn in self.clients.items():
-            conn.send(message)
+        self._fanout(message)
 
     def cascade_to_master(self, payload: HiveMessage, metadata: Optional[dict] = None) -> None:
         """Forward a CASCADE upstream. No-op at the top-level master."""
@@ -1821,10 +1870,16 @@ class HiveMindListenerProtocol:
 
         query_id = metadata.get("query_id", str(uuid.uuid4()))
         originator_peer = metadata.get("originator_peer", client.peer)
-        bus = self.get_bus(client)
-        bus.emit(Message("hive.cascade.received",
-                         {"query_id": query_id, "originator_peer": originator_peer},
-                         {"source": client.peer}))
+        try:
+            bus = self.get_bus(client)
+            bus.emit(Message(
+                "hive.cascade.received",
+                {"query_id": query_id, "originator_peer": originator_peer},
+                {"source": client.peer},
+            ))
+        except (ConnectionError, TimeoutError) as error:
+            self._send_backend_unavailable(client, message, error)
+            return
 
         self._answer_query_locally(
             message, client, query_id, originator_peer, HiveMessageType.CASCADE,
@@ -1832,10 +1887,7 @@ class HiveMindListenerProtocol:
 
         cascade_fwd = HiveMessage(HiveMessageType.CASCADE, payload=payload,
                                   metadata=metadata)
-        for peer in self.clients:
-            if peer == client.peer:
-                continue
-            self.clients[peer].send(cascade_fwd)
+        self._fanout(cascade_fwd, excluded_peer=client.peer)
         self.cascade_to_master(payload, metadata)
 
     def handle_escalate_message(
@@ -2021,8 +2073,12 @@ class HiveMindListenerProtocol:
         message.context["peer"] = message.context["source"] = client.peer
         message.context["source"] = client.peer
 
-        bus = self.get_bus(client)
-        bus.emit(message)
+        try:
+            bus = self.get_bus(client)
+            bus.emit(message)
+        except (ConnectionError, TimeoutError) as error:
+            self._send_backend_unavailable(client, message, error)
+            return
 
         self.policy_chain.observe(message, client)
 
@@ -2046,6 +2102,32 @@ class HiveMindListenerProtocol:
             client.send(HiveMessage(HiveMessageType.BUS, payload=payload))
         except Exception:
             LOG.exception(f"failed to send hive.policy.denied to {client.peer}")
+
+    def _send_backend_unavailable(
+            self, client: HiveMindClientConnection,
+            message: Union[Message, HiveMessage], error: Exception) -> None:
+        """Tell an admitted client that its agent backend is unavailable."""
+        msg_type = str(message.msg_type)
+        LOG.error(
+            f"Can not forward '{msg_type}' from {client.peer}; "
+            f"the agent bus is unavailable: {error}"
+        )
+        payload = Message(
+            "hive.policy.denied",
+            {
+                "denied_type": msg_type,
+                "code": BACKEND_UNAVAILABLE,
+                "reason": str(error),
+                "data": {},
+            },
+            {"source": "hivemind-core", "destination": client.peer},
+        )
+        try:
+            client.send(HiveMessage(HiveMessageType.BUS, payload=payload))
+        except Exception:
+            LOG.exception(
+                f"failed to send backend_unavailable to {client.peer}"
+            )
 
     def handle_client_shared_bus(self, message: Message, client: HiveMindClientConnection):
         # this message is going inside the client bus

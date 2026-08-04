@@ -800,6 +800,28 @@ class TestProtocolWiring(unittest.TestCase):
         self.assertEqual(len(emitted), 1)
         self.assertFalse(client.send.called)
 
+    def test_unavailable_agent_bus_returns_structured_denial(self):
+        """A disconnected backend fails fast without dropping the listener."""
+        proto, _ = self._make_protocol()
+        proto.agent_protocol.get_bus.side_effect = ConnectionError("offline")
+        client = self._make_client()
+
+        msg = Message("speak", {"utterance": "hi"})
+        proto.handle_inject_agent_msg(msg, client)
+
+        client.send.assert_called_once()
+        denied = client.send.call_args.args[0].payload
+        self.assertEqual(denied.msg_type, "hive.policy.denied")
+        self.assertEqual(denied.data["code"], "backend_unavailable")
+        self.assertEqual(denied.data["denied_type"], "speak")
+
+    def test_unavailable_agent_bus_does_not_break_lifecycle_cleanup(self):
+        proto, _ = self._make_protocol()
+        proto.agent_protocol.get_bus.side_effect = ConnectionError("offline")
+        client = self._make_client()
+
+        proto._emit_lifecycle(client, Message("hive.client.disconnect"))
+
     def test_observe_called_after_emit(self):
         """observe() fires after bus.emit, and exceptions are swallowed."""
         from hivemind_core.policy import PolicyChain
