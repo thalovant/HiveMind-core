@@ -26,10 +26,10 @@ dependencies = [
     "rich",
     "pycryptodomex",
     "poorman-handshake>=2.0.0a1,<3.0.0",
-    # protocol v3 (Noise) needs hivemind_bus_client.noise, shipped since
-    # 0.10.1a1; the server still degrades gracefully to the legacy handshake
-    # against older clients on the wire.
-    "hivemind_bus_client>=0.10.1a1,<1.0.0",
+    # 1.0.0a1 removes the obsolete THIRDPRTY wire code while preserving the
+    # protocol APIs Core uses. Keep this aligned with the current OVOS agent
+    # stack so downstream applications can resolve one supported bus client.
+    "hivemind_bus_client>=1.0.0a1,<2.0.0",
     "ovos_utils>=0.0.33,<1.0.0",
     "pybase64",
     "hivemind-plugin-manager>=0.8.0a1,<1.0.0",
@@ -48,7 +48,7 @@ test = [
     "pytest",
     "pytest-cov",
     "hivescope>=0.5.0a2",
-    # client-side Noise (hivemind_bus_client>=0.10.1a1) comes from the runtime
+    # client-side Noise (hivemind_bus_client>=1.0.0a1) comes from the runtime
     # dependency above — no git ref, so the wheel stays PyPI-publishable.
 ]
 integration = [
