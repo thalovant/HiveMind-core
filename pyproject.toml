@@ -75,6 +75,9 @@ hivemind-core = "hivemind_core.scripts:hmcore_cmds"
 "hivemind-message-type-acl-policy" = "hivemind_core.policy:MessageTypeACLPolicy"
 "hivemind-deny-all-policy" = "hivemind_core.policy:DenyAllPolicy"
 
+[project.entry-points."hivemind.performance.metrics"]
+core = "hivemind_core._metrics:performance_histograms"
+
 [tool.setuptools]
 packages = ["hivemind_core"]
 
