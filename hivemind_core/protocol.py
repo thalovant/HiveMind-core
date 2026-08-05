@@ -1034,7 +1034,7 @@ class HiveMindListenerProtocol:
 
         Process message from client, decide what to do internally here
         """
-        LOG.debug(f"message: {message}")
+        _log.debug("message: %s", message)
         # update internal peer ID
         message.update_source_peer(client.peer)
 
@@ -2131,7 +2131,11 @@ class HiveMindListenerProtocol:
             return
 
         # send client message to internal mycroft bus
-        LOG.info(f"Forwarding message '{message.msg_type}' to agent bus from client: {client.peer}")
+        _log.debug(
+            "Forwarding message %r to agent bus from client: %s",
+            message.msg_type,
+            client.peer,
+        )
         message.context["peer"] = message.context["source"] = client.peer
         message.context["source"] = client.peer
 
