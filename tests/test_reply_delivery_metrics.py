@@ -75,7 +75,7 @@ def test_request_id_is_found_in_nested_ovos_metadata():
 
 
 def test_transport_completion_emits_opt_in_correlated_trace(
-        monkeypatch, caplog):
+        monkeypatch):
     delivery = Future()
     client = _client(lambda _payload, _binary: delivery)
     message = HiveMessage(
@@ -91,24 +91,29 @@ def test_transport_completion_emits_opt_in_correlated_trace(
         "hivemind_core.performance.time.time_ns",
         lambda: 123_000_000,
     )
-    caplog.set_level("INFO", logger="hivemind.performance.trace")
+    logged = []
+    monkeypatch.setattr(
+        "hivemind_core.performance._LOG.info",
+        lambda template, payload: logged.append(template % payload),
+    )
 
     client.send(message)
 
-    assert "performance_trace" not in caplog.text
+    assert logged == []
     delivery.set_result(None)
-    assert "listener_transport_complete" in caplog.text
-    assert '"request_id":"request-transport"' in caplog.text
-    assert '"at_unix_ns":123000000' in caplog.text
+    assert "listener_transport_complete" in logged[0]
+    assert '"request_id":"request-transport"' in logged[0]
+    assert '"at_unix_ns":123000000' in logged[0]
 
 
-def test_trace_is_silent_without_explicit_opt_in(monkeypatch, caplog):
+def test_trace_is_silent_without_explicit_opt_in(monkeypatch):
     monkeypatch.delenv("HIVEMIND_PERFORMANCE_TRACE", raising=False)
-    caplog.set_level("INFO", logger="hivemind.performance.trace")
+    monkeypatch.setattr(
+        "hivemind_core.performance._LOG.info",
+        lambda *_args: pytest.fail("disabled trace emitted a log"),
+    )
 
     trace_performance_stage("test", request_id="request-silent")
-
-    assert "request-silent" not in caplog.text
 
 
 def test_disabled_transport_trace_does_not_extract_request_id(monkeypatch):

@@ -9,13 +9,14 @@ processes.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import time
 from collections import deque
 from typing import Any
 
-_LOG = logging.getLogger("hivemind.performance.trace")
+from ovos_utils.log import LOG
+
+_LOG = LOG
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _DIRECT_ID_KEYS = ("query_id", "request_id", "qa_query_id")
 _NESTED_KEYS = ("context", "data", "metadata", "payload")
