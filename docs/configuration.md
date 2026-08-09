@@ -82,6 +82,14 @@ The file is created with defaults on first run if absent.
 | `query_queue_size` | integer | `256` | Additional queued QUERY requests; excess requests receive an explicit `busy` response |
 | `reply_delivery_timeout` | number | `5` | Maximum seconds a QUERY worker waits for transport-confirmed client reply delivery |
 
+`HIVEMIND_PERFORMANCE_TRACE=true` is an opt-in benchmark control. It emits a
+structured `listener_transport_complete` event after a correlated public reply
+finishes its transport write. The event contains only `stage`, an opaque
+request ID, and `at_unix_ns`; request IDs are never added to Prometheus labels.
+The websocket protocol emits the paired `listener_receive` boundary under the
+same control. Tracing is disabled by default and does not change a frame or
+message context.
+
 ---
 
 ## `agent_protocol`

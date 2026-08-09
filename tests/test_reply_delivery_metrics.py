@@ -3,10 +3,15 @@
 from concurrent.futures import Future
 from unittest.mock import MagicMock
 
+import pytest
 from hivemind_bus_client import HiveMessage, HiveMessageType
 from ovos_bus_client.message import Message
 
 from hivemind_core._metrics import REPLY_DELIVERY
+from hivemind_core.performance import (
+    message_request_id,
+    trace_performance_stage,
+)
 from hivemind_core.protocol import HiveMindClientConnection
 
 
@@ -54,3 +59,67 @@ def test_handshake_traffic_is_not_counted_as_reply_delivery():
     client.send(HiveMessage(HiveMessageType.HELLO, payload={}))
 
     assert REPLY_DELIVERY.snapshot()["count"] == initial
+
+
+def test_request_id_is_found_in_nested_ovos_metadata():
+    message = HiveMessage(
+        HiveMessageType.BUS,
+        payload=Message(
+            "speak",
+            {"utterance": "hello"},
+            {"metadata": {"qa_query_id": "request-42"}},
+        ),
+    )
+
+    assert message_request_id(message) == "request-42"
+
+
+def test_transport_completion_emits_opt_in_correlated_trace(
+        monkeypatch, caplog):
+    delivery = Future()
+    client = _client(lambda _payload, _binary: delivery)
+    message = HiveMessage(
+        HiveMessageType.BUS,
+        payload=Message(
+            "speak",
+            {"utterance": "hello"},
+            {"query_id": "request-transport"},
+        ),
+    )
+    monkeypatch.setenv("HIVEMIND_PERFORMANCE_TRACE", "true")
+    monkeypatch.setattr(
+        "hivemind_core.performance.time.time_ns",
+        lambda: 123_000_000,
+    )
+    caplog.set_level("INFO", logger="hivemind.performance.trace")
+
+    client.send(message)
+
+    assert "performance_trace" not in caplog.text
+    delivery.set_result(None)
+    assert "listener_transport_complete" in caplog.text
+    assert '"request_id":"request-transport"' in caplog.text
+    assert '"at_unix_ns":123000000' in caplog.text
+
+
+def test_trace_is_silent_without_explicit_opt_in(monkeypatch, caplog):
+    monkeypatch.delenv("HIVEMIND_PERFORMANCE_TRACE", raising=False)
+    caplog.set_level("INFO", logger="hivemind.performance.trace")
+
+    trace_performance_stage("test", request_id="request-silent")
+
+    assert "request-silent" not in caplog.text
+
+
+def test_disabled_transport_trace_does_not_extract_request_id(monkeypatch):
+    monkeypatch.delenv("HIVEMIND_PERFORMANCE_TRACE", raising=False)
+    monkeypatch.setattr(
+        "hivemind_core.protocol.message_request_id",
+        lambda _message: pytest.fail("disabled trace extracted request ID"),
+    )
+    client = _client(lambda _payload, _binary: None)
+
+    client.send(HiveMessage(
+        HiveMessageType.BUS,
+        payload=Message("speak", {"utterance": "hello"}),
+    ))
