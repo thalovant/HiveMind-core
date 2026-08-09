@@ -22,11 +22,6 @@ from ovos_utils.fakebus import FakeBus
 from ovos_utils.log import LOG
 from hivemind_core.config import get_server_config
 from hivemind_core._metrics import REPLY_DELIVERY
-from hivemind_core.performance import (
-    message_request_id,
-    performance_trace_enabled,
-    trace_performance_stage,
-)
 from hivemind_bus_client.identity import NodeIdentity
 from hivemind_bus_client.message import HiveMessage, HiveMessageType, HiveMindBinaryPayloadType
 from hivemind_bus_client.serialization import decode_bitstring, get_bitstring
@@ -248,12 +243,6 @@ class HiveMindClientConnection:
         with self._send_lock:
             is_bin = message.msg_type == HiveMessageType.BINARY
             track_delivery = self._is_reply_delivery(message)
-            request_id = (
-                message_request_id(message)
-                if self._is_speech_reply(message)
-                and performance_trace_enabled()
-                else None
-            )
             if not is_bin and message.msg_type == HiveMessageType.BUS:
                 payload_type = (message.payload.get("type")
                                 if isinstance(message.payload, dict)
@@ -274,9 +263,7 @@ class HiveMindClientConnection:
                     payload = (plaintext if plaintext is not None
                                else message.serialize())
                 encrypted = self.noise_transport.encrypt_frame(payload)
-                return self._send_transport(
-                    encrypted, True, track_delivery, request_id
-                )
+                return self._send_transport(encrypted, True, track_delivery)
 
             if self.crypto_key and message.msg_type not in [
                 HiveMessageType.HANDSHAKE,
@@ -314,23 +301,10 @@ class HiveMindClientConnection:
                            else message.serialize())
                 _log.debug("sent unencrypted")
 
-            return self._send_transport(
-                payload, is_bin, track_delivery, request_id
-            )
+            return self._send_transport(payload, is_bin, track_delivery)
 
     @staticmethod
-    def _is_speech_reply(message: HiveMessage) -> bool:
-        """Return whether a frame contains client-visible speech."""
-        if message.msg_type != HiveMessageType.BUS:
-            return False
-        if isinstance(message.payload, dict):
-            payload_type = message.payload.get("type")
-        else:
-            payload_type = getattr(message.payload, "msg_type", None)
-        return payload_type in {"speak", "ovos.utterance.speak"}
-
-    @classmethod
-    def _is_reply_delivery(cls, message: HiveMessage) -> bool:
+    def _is_reply_delivery(message: HiveMessage) -> bool:
         """Return whether a frame completes a public request/reply exchange.
 
         Handshake, ping, and unrelated downstream traffic would make the
@@ -340,18 +314,20 @@ class HiveMindClientConnection:
         """
         if message.msg_type in (HiveMessageType.QUERY, HiveMessageType.CASCADE):
             return True
-        if cls._is_speech_reply(message):
-            return True
         if message.msg_type != HiveMessageType.BUS:
             return False
-        payload_type = (message.payload.get("type")
-                        if isinstance(message.payload, dict)
-                        else getattr(message.payload, "msg_type", None))
-        return payload_type == "ovos.utterance.handled"
+        if isinstance(message.payload, dict):
+            payload_type = message.payload.get("type")
+        else:
+            payload_type = getattr(message.payload, "msg_type", None)
+        return payload_type in {
+            "speak",
+            "ovos.utterance.speak",
+            "ovos.utterance.handled",
+        }
 
     def _send_transport(self, payload, is_binary: bool,
-                        track_delivery: bool,
-                        request_id: Optional[str] = None):
+                        track_delivery: bool):
         """Write one frame and observe completion without changing its Future.
 
         Tornado and concurrent futures both expose ``add_done_callback``. The
@@ -368,11 +344,6 @@ class HiveMindClientConnection:
             REPLY_DELIVERY.observe_ms(
                 (time.monotonic() - started) * 1000
             )
-            if request_id is not None:
-                trace_performance_stage(
-                    "listener_transport_complete",
-                    request_id=request_id,
-                )
 
         add_done_callback = getattr(delivery, "add_done_callback", None)
         if callable(add_done_callback):
