@@ -106,6 +106,24 @@ def test_transport_completion_emits_opt_in_correlated_trace(
     assert '"at_unix_ns":123000000' in logged[0]
 
 
+def test_handled_delivery_does_not_emit_speech_completion_trace(monkeypatch):
+    monkeypatch.setenv("HIVEMIND_PERFORMANCE_TRACE", "true")
+    monkeypatch.setattr(
+        "hivemind_core.performance._LOG.info",
+        lambda *_args: pytest.fail("handled event emitted speech trace"),
+    )
+    client = _client(lambda _payload, _binary: None)
+
+    client.send(HiveMessage(
+        HiveMessageType.BUS,
+        payload=Message(
+            "ovos.utterance.handled",
+            {},
+            {"query_id": "request-handled"},
+        ),
+    ))
+
+
 def test_trace_is_silent_without_explicit_opt_in(monkeypatch):
     monkeypatch.delenv("HIVEMIND_PERFORMANCE_TRACE", raising=False)
     monkeypatch.setattr(

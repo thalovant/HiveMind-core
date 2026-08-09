@@ -250,7 +250,8 @@ class HiveMindClientConnection:
             track_delivery = self._is_reply_delivery(message)
             request_id = (
                 message_request_id(message)
-                if track_delivery and performance_trace_enabled()
+                if self._is_speech_reply(message)
+                and performance_trace_enabled()
                 else None
             )
             if not is_bin and message.msg_type == HiveMessageType.BUS:
@@ -318,7 +319,18 @@ class HiveMindClientConnection:
             )
 
     @staticmethod
-    def _is_reply_delivery(message: HiveMessage) -> bool:
+    def _is_speech_reply(message: HiveMessage) -> bool:
+        """Return whether a frame contains client-visible speech."""
+        if message.msg_type != HiveMessageType.BUS:
+            return False
+        if isinstance(message.payload, dict):
+            payload_type = message.payload.get("type")
+        else:
+            payload_type = getattr(message.payload, "msg_type", None)
+        return payload_type in {"speak", "ovos.utterance.speak"}
+
+    @classmethod
+    def _is_reply_delivery(cls, message: HiveMessage) -> bool:
         """Return whether a frame completes a public request/reply exchange.
 
         Handshake, ping, and unrelated downstream traffic would make the
@@ -328,17 +340,14 @@ class HiveMindClientConnection:
         """
         if message.msg_type in (HiveMessageType.QUERY, HiveMessageType.CASCADE):
             return True
+        if cls._is_speech_reply(message):
+            return True
         if message.msg_type != HiveMessageType.BUS:
             return False
-        if isinstance(message.payload, dict):
-            payload_type = message.payload.get("type")
-        else:
-            payload_type = getattr(message.payload, "msg_type", None)
-        return payload_type in {
-            "speak",
-            "ovos.utterance.speak",
-            "ovos.utterance.handled",
-        }
+        payload_type = (message.payload.get("type")
+                        if isinstance(message.payload, dict)
+                        else getattr(message.payload, "msg_type", None))
+        return payload_type == "ovos.utterance.handled"
 
     def _send_transport(self, payload, is_binary: bool,
                         track_delivery: bool,
@@ -359,10 +368,11 @@ class HiveMindClientConnection:
             REPLY_DELIVERY.observe_ms(
                 (time.monotonic() - started) * 1000
             )
-            trace_performance_stage(
-                "listener_transport_complete",
-                request_id=request_id,
-            )
+            if request_id is not None:
+                trace_performance_stage(
+                    "listener_transport_complete",
+                    request_id=request_id,
+                )
 
         add_done_callback = getattr(delivery, "add_done_callback", None)
         if callable(add_done_callback):
