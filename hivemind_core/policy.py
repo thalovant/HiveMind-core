@@ -24,6 +24,9 @@ if TYPE_CHECKING:
     from hivemind_core.protocol import HiveMindClientConnection
 
 
+BACKEND_UNAVAILABLE = "backend_unavailable"
+
+
 @dataclass
 class PolicyChain:
     """Ordered list of policy plugins evaluated for every admission decision.

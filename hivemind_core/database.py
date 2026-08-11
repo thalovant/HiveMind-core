@@ -46,6 +46,16 @@ class ClientDatabase:
             return search[0]
         return None
 
+    def get_client_by_api_key_with_metrics(
+            self, api_key: str) -> tuple[Optional[Client], Dict[str, float]]:
+        """Return a client plus backend-provided credential timing details."""
+        detailed_lookup = getattr(
+            self.db, "get_client_by_api_key_with_metrics", None
+        )
+        if callable(detailed_lookup):
+            return detailed_lookup(api_key)
+        return self.get_client_by_api_key(api_key), {}
+
     def get_client_by_id(self, client_id: int) -> Optional[Client]:
         return self.db.get_client_by_id(client_id)
 

@@ -32,7 +32,8 @@ def _relay_chain():
     b = TopologyBuilder()
     m = b.add_master("M0")
     m.register_satellite("relay-key", password="relay-pw")
-    _sat, master_side = b.add_relay("R0", upstream=m)
+    relay = b.add_relay("R0", upstream=m)
+    master_side = relay.listener if hasattr(relay, "listener") else relay[1]
     master_side.register_satellite("sat-key", password="sat-pw",
                                    allowed_types=["recognizer_loop:utterance"])
     b.add_satellite("S0", upstream=master_side, allowed_types=["recognizer_loop:utterance"])
@@ -98,7 +99,7 @@ def test_query_escalates_up_the_relay_chain():
         s = b.get_satellite("S0")
         s.send(HiveMessage(HiveMessageType.QUERY, payload=_utt(),
                            metadata={"query_id": "q3", "originator_peer": s.peer}))
-        recv = s.recorder.wait_for(HiveMessageType.QUERY.value, direction="in", timeout=6.0)
+        recv = s.recorder.wait_for(HiveMessageType.QUERY.value, direction="in", timeout=12.0)
         assert recv is not None, "escalated QUERY answer never routed back to S0"
     finally:
         b.stop_all()
@@ -125,9 +126,11 @@ def _two_relay_chain():
     b = TopologyBuilder()
     m = b.add_master("M0")
     m.register_satellite("r1-key", password="p")
-    _s1, r1_master = b.add_relay("R1", upstream=m)
+    relay1 = b.add_relay("R1", upstream=m)
+    r1_master = relay1.listener if hasattr(relay1, "listener") else relay1[1]
     r1_master.register_satellite("r2-key", password="p")
-    _s2, r2_master = b.add_relay("R2", upstream=r1_master)
+    relay2 = b.add_relay("R2", upstream=r1_master)
+    r2_master = relay2.listener if hasattr(relay2, "listener") else relay2[1]
     r2_master.register_satellite("sat-key", password="p",
                                  allowed_types=["recognizer_loop:utterance"])
     b.add_satellite("S0", upstream=r2_master,

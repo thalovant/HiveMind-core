@@ -753,6 +753,7 @@ class TestProtocolWiring(unittest.TestCase):
         client._resolved_user_ts = 0.0
         # capture send calls
         client.send = MagicMock()
+        client.disconnect = MagicMock()
         return client
 
     def test_deny_sends_hive_policy_denied_to_client(self):
@@ -799,6 +800,42 @@ class TestProtocolWiring(unittest.TestCase):
 
         self.assertEqual(len(emitted), 1)
         self.assertFalse(client.send.called)
+
+    def test_unavailable_agent_bus_returns_structured_denial(self):
+        """A disconnected backend fails fast without dropping the listener."""
+        proto, _ = self._make_protocol()
+        proto.agent_protocol.get_bus.side_effect = ConnectionError("offline")
+        client = self._make_client()
+
+        msg = Message("speak", {"utterance": "hi"})
+        proto.handle_inject_agent_msg(msg, client)
+
+        client.send.assert_called_once()
+        denied = client.send.call_args.args[0].payload
+        self.assertEqual(denied.msg_type, "hive.policy.denied")
+        self.assertEqual(denied.data["code"], "backend_unavailable")
+        self.assertEqual(denied.data["denied_type"], "speak")
+
+    def test_unavailable_agent_bus_does_not_break_lifecycle_cleanup(self):
+        """A bus outage must not interrupt the real disconnect cleanup path."""
+        from threading import Lock
+
+        proto, _ = self._make_protocol()
+        proto.agent_protocol.get_bus.side_effect = ConnectionError("offline")
+        client = self._make_client()
+        proto.clients[client.peer] = client
+        proto._last_seen_lock = Lock()
+        proto._last_seen_next_flush = {client.key: 123.0}
+
+        proto.handle_client_disconnected(client)
+
+        self.assertNotIn(client.peer, proto.clients)
+        self.assertNotIn(client.key, proto._last_seen_next_flush)
+        client.disconnect.assert_called_once_with()
+        proto.callbacks.on_disconnect.assert_called_once_with(client)
+        proto.binary_data_protocol.callbacks.on_disconnect.assert_called_once_with(
+            client)
+        proto.agent_protocol.callbacks.on_disconnect.assert_called_once_with(client)
 
     def test_observe_called_after_emit(self):
         """observe() fires after bus.emit, and exceptions are swallowed."""

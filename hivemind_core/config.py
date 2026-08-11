@@ -80,10 +80,10 @@ _DEFAULT = {
         ],
     },
 
-    # Optional debounce for best-effort client-db last_seen persistence.
-    # The default preserves the old per-message persistence frequency while
-    # the protocol keeps database I/O off the message-handling thread.
-    "last_seen_update_interval": 0,
+    # Persist at most one best-effort last_seen update per client per minute.
+    # Set to 0 to restore per-message persistence when a deployment explicitly
+    # needs that write frequency.
+    "last_seen_update_interval": 60,
     "last_seen_queue_size": 1024,
 
     # QUERY handling is isolated from websocket receive threads. Capacity is
@@ -91,6 +91,7 @@ _DEFAULT = {
     # instead of unbounded thread or memory growth.
     "query_workers": 16,
     "query_queue_size": 256,
+    "reply_delivery_timeout": 5,
 }
 
 

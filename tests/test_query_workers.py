@@ -1,5 +1,6 @@
 import threading
 import time
+from concurrent.futures import Future
 from types import SimpleNamespace
 
 from hivemind_bus_client.message import HiveMessage, HiveMessageType
@@ -128,6 +129,21 @@ class _Client:
 
     def authorize(self, _message):
         return True
+
+
+class _ConfirmedClient(_Client):
+    def __init__(self, name="client"):
+        super().__init__(name=name)
+        self.delivery_started = threading.Event()
+        self.delivery = Future()
+
+    def send(self, message):
+        super().send(message)
+        inner = getattr(getattr(message, "payload", None), "payload", None)
+        if getattr(inner, "msg_type", None) == "speak":
+            self.delivery_started.set()
+            return self.delivery
+        return None
 
 
 def _protocol(monkeypatch, agent=None, config=None):
@@ -354,6 +370,24 @@ def test_query_response_preserves_only_safe_skill_provenance(monkeypatch):
             "skill_id": "answer.skill",
         }
     finally:
+        proto.shutdown()
+
+
+def test_query_stream_waits_for_confirmed_reply_delivery(monkeypatch):
+    proto = _protocol(monkeypatch, agent=_ContextAwareAgent())
+    client = _ConfirmedClient()
+
+    try:
+        proto.handle_query_message(_request("q-delivery", "hello"), client)
+
+        assert client.delivery_started.wait(1)
+        assert len(client.sent) == 1
+        client.delivery.set_result(None)
+
+        assert len(_wait_for_messages(client, 2)) == 2
+    finally:
+        if not client.delivery.done():
+            client.delivery.set_result(None)
         proto.shutdown()
 
 
