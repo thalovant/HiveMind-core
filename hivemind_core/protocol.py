@@ -853,17 +853,26 @@ class HiveMindListenerProtocol:
                 raise
 
     def _stop_last_seen_worker(self, timeout: float = 5.0) -> None:
-        """Drain and stop the activity writer, releasing listener references."""
-        self._last_seen_stop.set()
-        thread = self._last_seen_thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
-            if thread.is_alive():
-                LOG.warning("Timed out stopping the HiveMind last_seen worker")
-                return
-        self._last_seen_queue = None
-        self._last_seen_thread = None
-        self._last_seen_worker_started = False
+        """Drain and stop the activity writer, releasing listener references.
+
+        Under the same lock the start path holds. `shutdown()` sets
+        `_shutdown_requested` first and the start path refuses once it is set,
+        but a start that had already passed that check was still inside the
+        lock assigning the thread and queue while this ran -- so a stop could
+        null them and then watch a worker appear behind it. The worker thread
+        never takes this lock, so joining while holding it cannot deadlock.
+        """
+        with self._last_seen_start_lock:
+            self._last_seen_stop.set()
+            thread = self._last_seen_thread
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=timeout)
+                if thread.is_alive():
+                    LOG.warning("Timed out stopping the HiveMind last_seen worker")
+                    return
+            self._last_seen_queue = None
+            self._last_seen_thread = None
+            self._last_seen_worker_started = False
 
     def shutdown(self) -> None:
         """Release background resources owned by this listener protocol."""

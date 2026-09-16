@@ -171,6 +171,14 @@ class HiveMindService:
             self._start_presence()
             wait_for_exit_signal()  # block until ctrl+c
         finally:
-            self._stop_presence()
-            hm_protocol.shutdown()
-            self._status.set_stopping()
+            # Nested, so each cleanup action happens whatever the one before it
+            # did. Sequential calls meant a raising _stop_presence() skipped
+            # both the protocol shutdown and the status transition, leaving a
+            # service that reported ready while it was gone.
+            try:
+                self._stop_presence()
+            finally:
+                try:
+                    hm_protocol.shutdown()
+                finally:
+                    self._status.set_stopping()

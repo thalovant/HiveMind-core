@@ -119,17 +119,25 @@ def test_full_queue_defers_retry_and_rate_limits_warnings():
     proto.last_seen_update_interval = 30
     proto._last_seen_queue = MagicMock()
     proto._last_seen_queue.put_nowait.side_effect = queue.Full
-    client = _client()
+    # Two different keys, because one client touched twice returns at the
+    # debounce gate the second time and never reaches the full queue -- so the
+    # test passed whether or not the warning was throttled at all.
+    first = _client(peer="one", key="access-key-one")
+    second = _client(peer="two", key="access-key-two")
 
     with (
         patch("hivemind_core.protocol.time.time", return_value=100.0),
         patch("hivemind_core.protocol.time.monotonic", return_value=10.0),
         patch("hivemind_core.protocol.LOG.warning") as warning,
     ):
-        proto.touch_last_seen(client)
-        proto.touch_last_seen(client)
+        proto.touch_last_seen(first)
+        proto.touch_last_seen(second)
 
-    assert proto._last_seen_next_flush[client.key] == 40.0
+    assert proto._last_seen_queue.put_nowait.call_count == 2, (
+        "both touches must reach the saturated queue"
+    )
+    assert proto._last_seen_next_flush[first.key] == 40.0
+    assert proto._last_seen_next_flush[second.key] == 40.0
     warning.assert_called_once_with("Dropping last_seen update because the queue is full")
 
 
@@ -180,3 +188,49 @@ def test_disconnect_clears_debounce_cache_after_last_key_peer_leaves():
 
     assert "access-key" not in proto._last_seen_next_flush
     assert proto._last_seen_next_flush["other-key"] == 101.0
+
+
+def test_a_start_racing_shutdown_cannot_resurrect_the_worker():
+    """Stop holds the lock start assigns under.
+
+    `shutdown()` sets `_shutdown_requested` before stopping, and the start path
+    refuses once that is set -- but a start that had already passed the check
+    was still inside the lock assigning the thread and queue while stop ran.
+    Stop could null them and then watch a worker appear behind it.
+    """
+    import threading
+
+    proto = _protocol(FakeClientDatabase(SimpleNamespace(last_seen=0)))
+    inside = threading.Event()
+    release = threading.Event()
+    real_thread_start = threading.Thread.start
+
+    def _slow_start(self):
+        if self.name == "hivemind-last-seen":
+            inside.set()
+            release.wait(5)
+        return real_thread_start(self)
+
+    with patch.object(threading.Thread, "start", _slow_start):
+        starter = threading.Thread(target=proto._start_last_seen_worker)
+        starter.start()
+        assert inside.wait(5), "the start path never reached thread creation"
+
+        stopped = threading.Event()
+
+        def _stop():
+            proto.shutdown()
+            stopped.set()
+
+        stopper = threading.Thread(target=_stop)
+        stopper.start()
+        # Stop must be waiting on the lock, not racing through it.
+        assert not stopped.wait(0.2), "stop ran while start held the lock"
+        release.set()
+        starter.join(5)
+        stopper.join(5)
+
+    assert stopped.is_set()
+    assert proto._last_seen_worker_started is False
+    assert proto._last_seen_thread is None
+    assert proto._last_seen_queue is None
