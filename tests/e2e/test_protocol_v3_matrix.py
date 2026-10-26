@@ -195,7 +195,7 @@ def test_tampered_negotiation_aborts_handshake(monkeypatch):
 # ────────────────────────────────────────────── replay resistance ──
 
 
-def test_replayed_v3_transport_message_is_rejected():
+def test_replayed_v3_transport_message_is_rejected(monkeypatch):
     b, m = _master()
     try:
         b.start_all()
@@ -207,16 +207,18 @@ def test_replayed_v3_transport_message_is_rejected():
         seen = []
         m.agent_protocol.bus.on("recognizer_loop:utterance", seen.append)
 
-        # capture the exact ciphertext of one legitimate transport message
+        # Observe the actual wire frame, independent of whether Noise encrypts
+        # through encrypt_frame or send_message's atomic encryption/send path.
         captured = []
-        original_encrypt = client.noise_transport.encrypt_frame
+        original_send = client.client.send
 
-        def capturing_encrypt(payload):
-            ct = original_encrypt(payload)
-            captured.append(ct)
-            return ct
+        def capturing_send(payload, opcode=ABNF.OPCODE_TEXT, *args, **kwargs):
+            result = original_send(payload, opcode, *args, **kwargs)
+            if opcode == ABNF.OPCODE_BINARY:
+                captured.append(payload)
+            return result
 
-        client.noise_transport.encrypt_frame = capturing_encrypt
+        monkeypatch.setattr(client.client, "send", capturing_send)
         client.emit(HiveMessage(
             HiveMessageType.BUS,
             payload=Message("recognizer_loop:utterance",
@@ -224,6 +226,7 @@ def test_replayed_v3_transport_message_is_rejected():
         ))
         assert _wait_for(lambda: len(seen) >= 1)
         assert captured, "no transport message captured"
+        monkeypatch.setattr(client.client, "send", original_send)
 
         # replay the captured ciphertext verbatim on the raw websocket:
         # the server's receive nonce has moved on, AEAD fails, the message

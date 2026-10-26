@@ -1,3 +1,5 @@
+Last Edit: Codex - 2026-10-26 - Motive: Index the legacy manager and harness compatibility evidence.
+
 # HiveMind Core
 
 HiveMind Core is the central hub (master node) of the HiveMind network. It accepts connections from satellites and other nodes, authenticates them, enforces per-client permissions, and routes messages to the configured AI agent backend.
@@ -28,6 +30,8 @@ HiveMind Core is fully **plugin-driven**:
 | **Database** | Where client credentials are stored (JSON, SQLite, Redis) | `database` config key |
 
 ## Documentation
+
+- [Dependency Security](dependency-security.md) - Real install constraints, the legacy manager API boundary and test-harness compatibility evidence.
 
 - [Architecture Guide](architecture.md) - Deep dive into Mind, Satellite, and Bridge components.
 - [Security and Encryption](security.md) - Handshakes, AES-256-GCM, and session keys.
