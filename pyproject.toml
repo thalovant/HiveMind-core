@@ -21,6 +21,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+    # Patched classic FileLock compatible with combo-lock's filelock~=3.0.
+    "filelock==3.20.3",
     "click",
     "click_default_group",
     "rich",
