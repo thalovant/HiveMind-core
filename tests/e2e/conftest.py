@@ -13,6 +13,7 @@ import json
 import pytest
 
 import poorman_handshake.symmetric as _pm_symmetric
+from hivescope.node import InProcessHiveShim
 
 
 @pytest.fixture(autouse=True)
@@ -20,6 +21,14 @@ def isolated_xdg(monkeypatch, tmp_path):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+
+    # hivescope 0.6 keeps this fork's connection API, but its shim predates
+    # the bus client's link-password property. Forward the harness identity's
+    # real per-test credential, as newer hivescope does; never fake auth success.
+    monkeypatch.setattr(
+        InProcessHiveShim, "password",
+        property(lambda shim: shim.identity.password), raising=False,
+    )
 
     # The suite uses short human-readable passwords ("matrix-pwd", ...) that
     # poorman-handshake's strength backstop would refuse. Disable the runtime

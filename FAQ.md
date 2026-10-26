@@ -1,4 +1,4 @@
-Last Edit: Codex - 2026-10-25 - Motive: Record verified dependency security and compatibility constraints.
+Last Edit: Codex - 2026-10-26 - Motive: Explain the legacy dependency and test-harness compatibility boundaries.
 
 # FAQ
 
@@ -10,6 +10,18 @@ verified limits in [dependency security](docs/dependency-security.md).
 
 ## Does this alter runtime behavior?
 
-[ClientDatabase](hivemind_core/database.py) is unchanged. The regression tests exercise classic
-lock contention and real dependency metadata. Fresh installation with the unchanged plugin-manager range reproduces 19 pre-existing Client.crypto_key failures. The same failures occur on pristine dev; the security metadata/lock regressions pass. Narrowing plugin-manager below 0.9 made standalone tests pass but would conflict with the quota plugin, so no such bound is included. A coordinated Client API migration is outside this dependency patch.
+[ClientDatabase](hivemind_core/database.py) and the authentication/protocol code
+are unchanged. The installer now explicitly requires the manager's 0.8 API:
+this legacy fork still reads `Client.crypto_key`, which manager 0.9 removed.
+Consumers requiring manager 0.9 or newer need a coordinated API migration;
+they must not force an incompatible installation of this legacy fork.
+
+## Why is the test harness bounded below 0.7?
+
+Hivescope 0.7 changes its connection constructor to the newer Core API. The
+compatible 0.6 line predates the bus client's `password` property. A test-only
+adapter forwards the existing isolated identity credential, matching the newer
+harness's implementation. It does not supply a password, set a handshake-success
+flag or alter encryption. Replay tests capture the real binary WebSocket frame
+instead of an obsolete internal encryption callback.
 

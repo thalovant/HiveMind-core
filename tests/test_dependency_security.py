@@ -30,3 +30,16 @@ def test_combo_lock_excludes_other_instances_and_releases(tmp_path: Path) -> Non
     assert contender.acquire(blocking=False) is True
     contender.release()
 
+
+def test_legacy_client_api_support_is_explicit() -> None:
+    """The legacy fork must reject the manager that removed its Client API."""
+    requirements = [
+        Requirement(value)
+        for value in metadata("hivemind-core").get_all("Requires-Dist", [])
+    ]
+    selected = next(item for item in requirements if item.name == "hivemind-plugin-manager")
+    assert selected.specifier.contains("0.8.0a1", prereleases=True)
+    assert selected.specifier.contains("0.8.0a3", prereleases=True)
+    assert not selected.specifier.contains("0.9.0a1", prereleases=True)
+    assert not selected.specifier.contains("0.10.0a1", prereleases=True)
+

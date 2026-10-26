@@ -1,4 +1,4 @@
-Last Edit: Codex - 2026-10-25 - Motive: Index dependency security evidence and compatibility tests.
+Last Edit: Codex - 2026-10-26 - Motive: Index the legacy manager and harness compatibility evidence.
 
 # HiveMind Core
 
@@ -31,7 +31,7 @@ HiveMind Core is fully **plugin-driven**:
 
 ## Documentation
 
-- [Dependency Security](dependency-security.md) - Real install constraints and compatibility evidence.
+- [Dependency Security](dependency-security.md) - Real install constraints, the legacy manager API boundary and test-harness compatibility evidence.
 
 - [Architecture Guide](architecture.md) - Deep dive into Mind, Satellite, and Bridge components.
 - [Security and Encryption](security.md) - Handshakes, AES-256-GCM, and session keys.
