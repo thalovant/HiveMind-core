@@ -1,6 +1,25 @@
-Last Edit: Codex - 2026-10-26 - Motive: Record the tested legacy dependency boundary and real authentication harness repair.
+Last Edit: Claude Opus 5.5 - 2026-11-07 - Motive: Record removal of the unreachable relay-shape branch in the e2e helpers.
 
 # Maintenance Report
+
+## 2026-11-07: e2e relay helpers use one result shape
+
+`tests/e2e/test_query_streaming_e2e.py` (`_relay_chain`, `_two_relay_chain`)
+and `tests/e2e/test_relay_e2e.py` (`_relay_chain`) accepted both a
+`RelayNode` and a legacy `(satellite, master)` tuple from
+`hivescope.topology.TopologyBuilder.add_relay`. The test extra pins
+`hivescope>=0.6.6a1,<0.7`, and the only release in that range (0.6.6a1)
+returns a `RelayNode`, so the tuple branch could never run. It is removed;
+the helpers now read `RelayNode.listener` and fail loudly if the shape ever
+changes. Test-only change; no runtime code touched.
+
+Verification: full suite on Python 3.12, 226 passed, three existing skips,
+one existing XPASS (`test_fifo_order_relay_chain`).
+
+- AI model: Claude Opus 5.5.
+- Actions: removed the dead compatibility branch in three test helpers and
+  corrected the helper docstring.
+- Oversight: coordinating agent review plus CI before merge.
 
 ## Dependency compatibility
 
