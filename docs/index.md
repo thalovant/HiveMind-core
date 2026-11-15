@@ -1,5 +1,3 @@
-Last Edit: Codex - 2026-10-26 - Motive: Index the legacy manager and harness compatibility evidence.
-
 # HiveMind Core
 
 HiveMind Core is the central hub (master node) of the HiveMind network. It accepts connections from satellites and other nodes, authenticates them, enforces per-client permissions, and routes messages to the configured AI agent backend.

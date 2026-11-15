@@ -1,5 +1,3 @@
-Last Edit: Codex - 2026-10-26 - Motive: Record the legacy manager and test-harness compatibility boundaries.
-
 # Quick Facts
 
 | Field | Value |

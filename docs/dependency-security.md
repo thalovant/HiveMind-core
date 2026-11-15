@@ -1,5 +1,3 @@
-Last Edit: Codex - 2026-10-26 - Motive: Record actual passing legacy compatibility and authenticated harness checks.
-
 # Dependency Security
 
 The real installation source, `pyproject.toml`, pins `filelock==3.20.3`.

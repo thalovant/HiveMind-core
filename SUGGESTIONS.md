@@ -1,5 +1,3 @@
-Last Edit: Codex - 2026-10-26 - Motive: Record remaining manager migration and harness maintenance work.
-
 # Suggestions
 
 | Problem | Proposal | Impact |
