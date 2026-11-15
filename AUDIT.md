@@ -1,6 +1,8 @@
-Last Edit: Codex - 2026-10-26 - Motive: Replace reproduced incompatibility findings with tested boundaries and actual full-suite results.
-
 # Audit
+
+## 2026-11-15 - Per-file author/date/motive headers
+
+Finding: 7 files carried an author/date/motive header line that the owner has withdrawn. State: fixed in this change (a case-insensitive `git grep` for the header keyword is empty). No code path was touched, so no test result changes; the repository's CI on the pull request is the test of record.
 
 The security constraint is carried by the real installer, not solely by a
 scanner input. [Dependency tests](tests/test_dependency_security.py) verify

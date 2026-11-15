@@ -1,5 +1,3 @@
-Last Edit: Codex - 2026-10-26 - Motive: Explain the legacy dependency and test-harness compatibility boundaries.
-
 # FAQ
 
 ## Why is filelock pinned exactly?
